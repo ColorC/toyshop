@@ -59,7 +59,7 @@ def create_llm(
     """Create an LLM instance, defaulting to openhands config.toml values."""
     cfg = _read_config_toml()
     return LLM(
-        model=model or cfg.get("model", "openai/glm-5"),
+        model=model or cfg.get("model", "openai/gpt-5.3-codex"),
         api_key=SecretStr(api_key or cfg.get("api_key", "")),
         base_url=base_url or cfg.get("base_url"),
         temperature=temperature,
@@ -70,6 +70,9 @@ def create_llm(
         num_retries=2,
         retry_min_wait=2,
         retry_max_wait=10,
+        # Gateway proxies don't support these OpenAI-specific params
+        reasoning_effort=None,
+        prompt_cache_retention=None,
     )
 
 
