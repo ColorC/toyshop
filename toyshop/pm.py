@@ -349,6 +349,78 @@ def prepare_tasks(batch: BatchState) -> list[TaskState]:
     return task_states
 
 
+def _create_wiki_version(
+    batch: BatchState, workspace: Path, result: TDDResult, mode: str,
+) -> None:
+    """Create a wiki version + test suite after successful TDD."""
+    import re as _re
+    from toyshop.storage.database import init_database, get_latest_snapshot, create_project, get_db
+    from toyshop.storage.wiki import (
+        create_version, save_test_suite, extract_test_metadata, log_event,
+    )
+
+    db_path = workspace / ".toyshop" / "architecture.db"
+    init_database(db_path)
+
+    # Find or create project
+    db = get_db()
+    cur = db.execute(
+        "SELECT id FROM projects WHERE name = ? LIMIT 1",
+        (batch.project_name,),
+    )
+    row = cur.fetchone()
+    if row:
+        project_id = row["id"]
+    else:
+        proj = create_project(batch.project_name, str(workspace))
+        project_id = proj["id"]
+
+    latest_snap = get_latest_snapshot(project_id)
+
+    # Parse pass/fail from whitebox_output summary line
+    passed = failed = 0
+    m = _re.search(r"(\d+)\s+passed", result.whitebox_output)
+    if m:
+        passed = int(m.group(1))
+    m = _re.search(r"(\d+)\s+failed", result.whitebox_output)
+    if m:
+        failed = int(m.group(1))
+
+    version = create_version(
+        project_id=project_id,
+        snapshot_id=latest_snap["id"] if latest_snap else None,
+        change_type="create" if mode == "create" else "modify",
+        change_summary=result.summary or f"{passed} passed, {failed} failed",
+        change_source="tdd",
+        batch_id=batch.batch_id,
+        pipeline_result_json=json.dumps({
+            "success": result.success,
+            "whitebox_passed": result.whitebox_passed,
+            "blackbox_passed": result.blackbox_passed,
+            "retry_count": result.retry_count,
+        }),
+        openspec_dir=batch.batch_dir / "openspec",
+    )
+
+    test_files, test_cases = extract_test_metadata(workspace)
+    save_test_suite(
+        version_id=version.id,
+        test_files=test_files,
+        test_cases=test_cases,
+        total_tests=len(test_cases),
+        passed=passed,
+        failed=failed,
+    )
+
+    log_event(
+        project_id, "version_created",
+        f"v{version.version_number}: {passed} passed, {failed} failed",
+        version_id=version.id,
+    )
+    print(f"  [wiki] Created version {version.version_number} "
+          f"({len(test_cases)} tests, {len(test_files)} files)")
+
+
 def run_batch_tdd(batch: BatchState, llm: LLM, mode: str = "create") -> TDDResult:
     """Run a single TDD pipeline for the entire batch.
 
@@ -400,6 +472,13 @@ def run_batch_tdd(batch: BatchState, llm: LLM, mode: str = "create") -> TDDResul
     if not result.success:
         batch.error = result.summary
     _save_progress(batch)
+
+    # --- Wiki version (track architecture + test suite state) ---
+    if result.success:
+        try:
+            _create_wiki_version(batch, workspace, result, mode)
+        except Exception as wiki_err:
+            print(f"  [!] Wiki version creation failed: {wiki_err}")
 
     status_icon = "✓" if result.success else "✗"
     print(f"  [{status_icon}] Batch TDD — {batch.status}")

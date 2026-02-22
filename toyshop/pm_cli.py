@@ -211,6 +211,135 @@ def cmd_change_spec(args: argparse.Namespace) -> None:
     print("  python3 -m toyshop.pm_cli tdd --batch", args.batch)
 
 
+def cmd_wiki_history(args: argparse.Namespace) -> None:
+    """Show wiki version history for a batch."""
+    from toyshop.storage.database import init_database, get_db
+    from toyshop.storage.wiki import list_versions, get_test_suite
+
+    workspace = Path(args.batch) / "workspace"
+    db_path = workspace / ".toyshop" / "architecture.db"
+    if not db_path.exists():
+        print(f"No database at {db_path}")
+        sys.exit(1)
+
+    init_database(db_path)
+    db = get_db()
+    cur = db.execute("SELECT id, name FROM projects LIMIT 1")
+    row = cur.fetchone()
+    if not row:
+        print("No projects in database.")
+        return
+
+    project_id = row["id"]
+    print(f"Project: {row['name']} ({project_id})\n")
+
+    versions = list_versions(project_id, limit=int(args.limit))
+    if not versions:
+        print("No versions yet.")
+        return
+
+    for v in versions:
+        git = v.git_commit_hash[:8] if v.git_commit_hash else "unbound"
+        ts = get_test_suite(v.id)
+        test_info = f"{ts.passed}/{ts.total_tests} passed" if ts else "no tests"
+        print(f"  v{v.version_number:>3}  [{v.change_type:>6}]  {git}  "
+              f"{test_info:>16}  {v.change_summary[:60]}")
+
+
+def cmd_wiki_diff(args: argparse.Namespace) -> None:
+    """Show diff between two wiki versions."""
+    from toyshop.storage.database import init_database, get_db
+    from toyshop.storage.wiki import diff_versions
+
+    workspace = Path(args.batch) / "workspace"
+    db_path = workspace / ".toyshop" / "architecture.db"
+    if not db_path.exists():
+        print(f"No database at {db_path}")
+        sys.exit(1)
+
+    init_database(db_path)
+    db = get_db()
+    cur = db.execute("SELECT id FROM projects LIMIT 1")
+    row = cur.fetchone()
+    if not row:
+        print("No projects in database.")
+        return
+
+    diff = diff_versions(row["id"], int(args.from_ver), int(args.to_ver))
+    print(f"Diff v{diff.from_version} → v{diff.to_version}")
+    print(f"Summary: {diff.change_summary}\n")
+
+    if diff.modules_added:
+        print(f"Modules added:    {', '.join(diff.modules_added)}")
+    if diff.modules_removed:
+        print(f"Modules removed:  {', '.join(diff.modules_removed)}")
+    if diff.modules_modified:
+        print(f"Modules modified: {', '.join(diff.modules_modified)}")
+    if diff.interfaces_added:
+        print(f"Interfaces added:    {', '.join(diff.interfaces_added)}")
+    if diff.interfaces_removed:
+        print(f"Interfaces removed:  {', '.join(diff.interfaces_removed)}")
+    if diff.interfaces_modified:
+        print(f"Interfaces modified: {', '.join(diff.interfaces_modified)}")
+    if diff.tests_added:
+        print(f"Tests added:   {len(diff.tests_added)}")
+    if diff.tests_removed:
+        print(f"Tests removed: {len(diff.tests_removed)}")
+
+
+def cmd_wiki_commit(args: argparse.Namespace) -> None:
+    """Bind a git commit to the latest wiki version."""
+    import subprocess
+    from toyshop.storage.database import init_database, get_db
+    from toyshop.storage.wiki import get_latest_version, bind_git_commit
+
+    workspace = Path(args.batch) / "workspace"
+    db_path = workspace / ".toyshop" / "architecture.db"
+    if not db_path.exists():
+        print(f"No database at {db_path}")
+        sys.exit(1)
+
+    init_database(db_path)
+    db = get_db()
+    cur = db.execute("SELECT id FROM projects LIMIT 1")
+    row = cur.fetchone()
+    if not row:
+        print("No projects in database.")
+        return
+
+    version = get_latest_version(row["id"])
+    if not version:
+        print("No wiki versions to bind.")
+        return
+
+    if version.git_commit_hash:
+        print(f"v{version.version_number} already bound to {version.git_commit_hash[:8]}")
+        return
+
+    # Git commit in workspace
+    msg = args.message or f"wiki v{version.version_number}: {version.change_summary[:60]}"
+    try:
+        subprocess.run(
+            ["git", "add", "-A"], cwd=workspace, check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", msg], cwd=workspace, check=True,
+            capture_output=True,
+        )
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=workspace, check=True,
+            capture_output=True, text=True,
+        )
+        commit_hash = result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Git error: {e.stderr.decode() if e.stderr else e}")
+        sys.exit(1)
+
+    bind_git_commit(version.id, commit_hash)
+    print(f"Bound v{version.version_number} → {commit_hash[:8]}")
+
+
 # --- Helpers ---
 
 def _read_input(input_arg: str) -> str:
@@ -282,6 +411,22 @@ def main() -> None:
     p_cs = sub.add_parser("change-spec", help="Change step 3: Evolve openspec docs")
     p_cs.add_argument("--batch", required=True)
 
+    # wiki-history
+    p_wh = sub.add_parser("wiki-history", help="Show wiki version history")
+    p_wh.add_argument("--batch", required=True)
+    p_wh.add_argument("--limit", default="20")
+
+    # wiki-diff
+    p_wd = sub.add_parser("wiki-diff", help="Diff two wiki versions")
+    p_wd.add_argument("--batch", required=True)
+    p_wd.add_argument("--from", dest="from_ver", required=True)
+    p_wd.add_argument("--to", dest="to_ver", required=True)
+
+    # wiki-commit
+    p_wc = sub.add_parser("wiki-commit", help="Git commit + bind to latest wiki version")
+    p_wc.add_argument("--batch", required=True)
+    p_wc.add_argument("--message", "-m", default=None)
+
     args = parser.parse_args()
     cmd = {
         "run": cmd_run, "create": cmd_create, "spec": cmd_spec,
@@ -290,6 +435,9 @@ def main() -> None:
         "change-create": cmd_change_create,
         "change-analyze": cmd_change_analyze,
         "change-spec": cmd_change_spec,
+        "wiki-history": cmd_wiki_history,
+        "wiki-diff": cmd_wiki_diff,
+        "wiki-commit": cmd_wiki_commit,
     }
     cmd[args.command](args)
 

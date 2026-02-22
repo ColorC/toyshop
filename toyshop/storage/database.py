@@ -111,6 +111,63 @@ def _create_tables() -> None:
             )
         """)
 
+        # --- Wiki versioning tables ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS wiki_versions (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                version_number INTEGER NOT NULL,
+                git_commit_hash TEXT,
+                snapshot_id TEXT,
+                parent_version_id TEXT,
+                change_type TEXT NOT NULL DEFAULT 'create',
+                change_summary TEXT NOT NULL DEFAULT '',
+                change_source TEXT NOT NULL DEFAULT 'tdd',
+                batch_id TEXT,
+                pipeline_result_json TEXT,
+                proposal_md TEXT,
+                design_md TEXT,
+                tasks_md TEXT,
+                spec_md TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id),
+                FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
+            )
+        """)
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_wv_proj_num
+            ON wiki_versions(project_id, version_number)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_wv_git
+            ON wiki_versions(git_commit_hash)
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS wiki_test_suites (
+                id TEXT PRIMARY KEY,
+                version_id TEXT NOT NULL,
+                test_files_json TEXT NOT NULL,
+                test_cases_json TEXT NOT NULL,
+                total_tests INTEGER NOT NULL DEFAULT 0,
+                passed INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (version_id) REFERENCES wiki_versions(id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS wiki_changelog (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                version_id TEXT,
+                event_type TEXT NOT NULL,
+                event_detail TEXT NOT NULL DEFAULT '',
+                event_data_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        """)
+
 
 # ---------------------------------------------------------------------------
 # Project operations

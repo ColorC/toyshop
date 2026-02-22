@@ -10,6 +10,24 @@ from toyshop.storage.database import (
     save_architecture_from_design,
     get_latest_snapshot,
 )
+from toyshop.storage.wiki import (
+    WikiVersion,
+    WikiTestSuite,
+    VersionDiff,
+    create_version,
+    bind_git_commit,
+    save_test_suite,
+    get_version,
+    get_version_by_commit,
+    get_version_by_number,
+    get_latest_version,
+    list_versions,
+    get_test_suite,
+    diff_versions,
+    log_event,
+    get_changelog,
+    extract_test_metadata,
+)
 
 __all__ = [
     "init_database",
@@ -20,4 +38,21 @@ __all__ = [
     "get_project",
     "save_architecture_from_design",
     "get_latest_snapshot",
+    # Wiki
+    "WikiVersion",
+    "WikiTestSuite",
+    "VersionDiff",
+    "create_version",
+    "bind_git_commit",
+    "save_test_suite",
+    "get_version",
+    "get_version_by_commit",
+    "get_version_by_number",
+    "get_latest_version",
+    "list_versions",
+    "get_test_suite",
+    "diff_versions",
+    "log_event",
+    "get_changelog",
+    "extract_test_metadata",
 ]
