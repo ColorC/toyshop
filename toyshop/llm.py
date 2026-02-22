@@ -58,7 +58,7 @@ def create_llm(
 ) -> LLM:
     """Create an LLM instance, defaulting to openhands config.toml values."""
     cfg = _read_config_toml()
-    return LLM(
+    llm = LLM(
         model=model or cfg.get("model", "openai/gpt-5.3-codex"),
         api_key=SecretStr(api_key or cfg.get("api_key", "")),
         base_url=base_url or cfg.get("base_url"),
@@ -74,6 +74,33 @@ def create_llm(
         reasoning_effort=None,
         prompt_cache_retention=None,
     )
+    # Patch: gateway Responses API rejects temperature param;
+    # SDK hardcodes temperature=1.0 in select_responses_options when not subscription.
+    # Remove it after the fact so litellm's drop_params can handle it.
+    _patch_responses_options_no_temperature()
+    return llm
+
+
+def _patch_responses_options_no_temperature() -> None:
+    """One-time patch: strip forced temperature from Responses API kwargs.
+
+    Must patch both the source module AND the llm module's imported reference.
+    """
+    from openhands.sdk.llm.options import responses_options as _src_mod
+    from openhands.sdk.llm import llm as _llm_mod
+
+    if getattr(_src_mod, '_toyshop_patched', False):
+        return
+    _orig = _src_mod.select_responses_options
+
+    def _patched(llm_inst, user_kwargs, *, include, store):
+        out = _orig(llm_inst, user_kwargs, include=include, store=store)
+        out.pop("temperature", None)
+        return out
+
+    _src_mod.select_responses_options = _patched
+    _llm_mod.select_responses_options = _patched
+    _src_mod._toyshop_patched = True
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +149,6 @@ def chat_with_tool(
         tool_choice="auto",
         api_key=llm.api_key.get_secret_value() if llm.api_key else None,
         base_url=llm.base_url,
-        temperature=llm.temperature,
         timeout=llm.timeout,
         drop_params=True,
     )

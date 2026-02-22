@@ -105,6 +105,27 @@ MAX_CHALLENGE_RETRIES = 2  # max times Coding Agent can challenge hypotheses
 # v2 Debug Form flow constants
 MAX_DEBUG_FORM_RETRIES = 3   # max outer debug loop iterations
 MAX_REJECTION_RETRIES = 2    # max Code Agent → Test Agent rejection ping-pongs
+MAX_CONV_RETRIES = 3         # max retries for gateway 502 errors
+MAX_TOOL_CALL_RETRIES = 2   # max retries when analyst tool call not recognized
+
+
+def _run_conversation_with_retry(conv: Conversation, label: str = "") -> None:
+    """Run a conversation with retry on transient gateway errors (502, 503)."""
+    import time
+    for attempt in range(1, MAX_CONV_RETRIES + 1):
+        try:
+            conv.run()
+            return
+        except Exception as e:
+            err_str = str(e)
+            is_transient = any(k in err_str for k in ("BadGateway", "502", "503", "upstream_error", "ServiceUnavailable"))
+            if is_transient and attempt < MAX_CONV_RETRIES:
+                wait = 5 * attempt
+                print(f"  [retry] {label} attempt {attempt}/{MAX_CONV_RETRIES} failed (gateway error), waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            raise
+
 
 
 # =============================================================================
@@ -464,7 +485,28 @@ def _parse_design_interfaces(design_md: str) -> list[dict[str, str]]:
                 sig_text = sig_text.strip("`").strip()
             sig_lines_parsed = sig_text.split("\n")
             first_line = sig_lines_parsed[0].strip()
-            if first_line.startswith("class "):
+            # Handle decorator + class (e.g. @dataclass\nclass Foo:\n  field: int)
+            if first_line.startswith("@"):
+                # Find the class line after decorators
+                class_line_idx = None
+                for idx, sl in enumerate(sig_lines_parsed):
+                    if sl.strip().startswith("class "):
+                        class_line_idx = idx
+                        break
+                if class_line_idx is not None:
+                    class_line = sig_lines_parsed[class_line_idx].strip().rstrip(":")
+                    interfaces.append({"name": current_name, "signature": class_line, "module": current_module})
+                    for sl in sig_lines_parsed[class_line_idx + 1:]:
+                        sl = sl.strip()
+                        if not sl or sl.startswith("#"):
+                            continue
+                        if sl.startswith("def "):
+                            method_name = sl.split("(")[0].replace("def ", "").strip()
+                            interfaces.append({"name": method_name, "signature": sl, "module": current_module})
+                else:
+                    # Decorator without class — skip decorator, use name
+                    interfaces.append({"name": current_name, "signature": f"class {current_name}", "module": current_module})
+            elif first_line.startswith("class "):
                 interfaces.append({"name": current_name, "signature": first_line.rstrip(":"), "module": current_module})
                 for sl in sig_lines_parsed[1:]:
                     sl = sl.strip()
@@ -563,9 +605,15 @@ def _normalize_signature(name: str, sig: str) -> str:
     sig = sig.strip()
     if sig.startswith("def ") or sig.startswith("class "):
         return sig
+    # Decorator line — treat as class definition
+    if sig.startswith("@"):
+        return f"class {name}"
     # Bare signature like "(a: float, b: float) -> float"
     if sig.startswith("("):
         return f"def {name}{sig}"
+    # Type annotation like "name: str"
+    if ":" in sig and "(" not in sig:
+        return f"class {name}"
     # Just a type or name without parens
     return f"def {name}({sig})"
 
@@ -590,33 +638,27 @@ def _is_python_signature(sig: str) -> bool:
     return False
 
 
-def _generate_stub_code(interfaces: list[dict[str, str]]) -> str:
-    """Generate Python stub code from parsed interfaces."""
-    # Filter out non-Python signatures
-    py_interfaces = [i for i in interfaces if _is_python_signature(i["signature"])]
-
+def _generate_stub_code_for_module(ifaces: list[dict[str, str]]) -> str:
+    """Generate Python stub code for a single module's interfaces."""
     lines: list[str] = [
         '"""Auto-generated stubs from design.md signatures."""',
         "",
         "from __future__ import annotations",
-        "from typing import Any, List, Union",
+        "from typing import Any, Protocol",
         "from dataclasses import dataclass",
         "",
     ]
 
-    # Group: separate classes from standalone functions
     classes: dict[str, list[dict[str, str]]] = {}
     functions: list[dict[str, str]] = []
 
-    for iface in py_interfaces:
+    for iface in ifaces:
         sig = _normalize_signature(iface["name"], iface["signature"])
         iface = {**iface, "signature": sig}
         if sig.startswith("class "):
-            class_name = sig.replace("class ", "").strip()
+            class_name = sig.replace("class ", "").split("(")[0].split(":")[0].strip()
             classes[class_name] = []
         elif "self" in sig:
-            # Method — find which class it belongs to
-            # Heuristic: assign to the most recently defined class
             if classes:
                 last_class = list(classes.keys())[-1]
                 classes[last_class].append(iface)
@@ -625,9 +667,14 @@ def _generate_stub_code(interfaces: list[dict[str, str]]) -> str:
         else:
             functions.append(iface)
 
-    # Generate class stubs
     for class_name, methods in classes.items():
-        lines.append(f"class {class_name}:")
+        # Check if it's a Protocol class
+        orig = next((i for i in ifaces if i["name"] == class_name), None)
+        sig_raw = orig["signature"] if orig else ""
+        if "Protocol" in sig_raw:
+            lines.append(f"class {class_name}(Protocol):")
+        else:
+            lines.append(f"class {class_name}:")
         if not methods:
             lines.append("    pass")
         else:
@@ -638,7 +685,6 @@ def _generate_stub_code(interfaces: list[dict[str, str]]) -> str:
                 lines.append("")
         lines.append("")
 
-    # Generate standalone function stubs
     for func in functions:
         sig = func["signature"]
         lines.append(f"{sig}:")
@@ -824,50 +870,76 @@ def extract_signatures(workspace: Path, mode: str = "create") -> SignatureManife
     if not interfaces:
         return SignatureManifest(stub_files=[], test_dir="tests", modules=modules, interfaces=interfaces)
 
-    # Generate stub code
-    stub_code = _generate_stub_code(interfaces)
+    # Filter to Python-only interfaces
+    py_interfaces = [i for i in interfaces if _is_python_signature(i["signature"])]
+    if not py_interfaces:
+        return SignatureManifest(stub_files=[], test_dir="tests", modules=modules, interfaces=interfaces)
 
-    # Determine output path from modules or use default
-    # Find the first module with a filePath, or use a default
-    stub_path = None
+    # Build module_map for resolving file paths
+    module_map_paths: dict[str, str] = {}  # module_id → filePath
     for mod in modules:
+        name = mod.get("name", "")
         fp = mod.get("filePath", "").strip()
+        m = re.search(r"`(\w[\w-]*)`", name)
+        if m:
+            short_id = m.group(1)
+        elif "." in name:
+            short_id = name.rsplit(".", 1)[-1]
+        else:
+            short_id = name.lower().replace(" ", "_")
         if fp:
-            stub_path = workspace / fp
-            break
+            module_map_paths[short_id] = fp
 
-    if stub_path is None:
-        # Default: use project name from first module or "project"
-        project_name = "project"
-        if modules:
-            name = modules[0].get("name", "").lower().replace(" ", "_")
-            if name:
-                project_name = name
-        stub_dir = workspace / project_name
-        stub_dir.mkdir(parents=True, exist_ok=True)
-        stub_path = stub_dir / "stubs.py"
+    # Group interfaces by module
+    by_module: dict[str, list[dict[str, str]]] = {}
+    for iface in py_interfaces:
+        mod_id = iface.get("module", "").strip()
+        if not mod_id:
+            mod_id = "_misc"
+        by_module.setdefault(mod_id, []).append(iface)
 
-    # Ensure parent directory exists
-    stub_path.parent.mkdir(parents=True, exist_ok=True)
+    # Generate per-module stub files
+    stub_files: list[str] = []
+    created_dirs: set[str] = set()
 
-    if mode == "modify" and stub_path.exists():
-        # In modify mode, preserve existing code — don't overwrite with stubs.
-        # The existing file has real implementations that we want to keep.
-        # Just record it as the stub file for reference.
-        pass
-    else:
-        stub_path.write_text(stub_code, encoding="utf-8")
+    for mod_id, mod_ifaces in by_module.items():
+        file_path = module_map_paths.get(mod_id, "")
+        if not file_path:
+            # Fallback: use first module's directory + mod_id.py
+            fallback_dir = None
+            for fp in module_map_paths.values():
+                fallback_dir = str(Path(fp).parent)
+                break
+            if fallback_dir:
+                safe_id = re.sub(r"[^a-zA-Z0-9_]", "_", mod_id)
+                file_path = f"{fallback_dir}/{safe_id}.py"
+            else:
+                continue
 
-    # Create __init__.py if needed
-    init_path = stub_path.parent / "__init__.py"
-    if not init_path.exists():
-        init_path.write_text("", encoding="utf-8")
+        stub_path = workspace / file_path
+        stub_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Create __init__.py files for all package directories
+        pkg_dir = stub_path.parent
+        while pkg_dir != workspace and str(pkg_dir) not in created_dirs:
+            init_path = pkg_dir / "__init__.py"
+            if not init_path.exists():
+                init_path.write_text("", encoding="utf-8")
+            created_dirs.add(str(pkg_dir))
+            pkg_dir = pkg_dir.parent
+
+        if mode == "modify" and stub_path.exists():
+            # Preserve existing code in modify mode
+            pass
+        else:
+            stub_code = _generate_stub_code_for_module(mod_ifaces)
+            stub_path.write_text(stub_code, encoding="utf-8")
+
+        stub_files.append(str(stub_path.relative_to(workspace)))
 
     # Create tests directory
     test_dir = workspace / "tests"
     test_dir.mkdir(parents=True, exist_ok=True)
-
-    stub_files = [str(stub_path.relative_to(workspace))]
 
     # Phase 1.5: Generate test skeletons with correct imports
     module_map = _build_module_map(modules)
@@ -1816,7 +1888,7 @@ def run_tdd_pipeline(
             f"{modify_hint}\n"
             f"Create test files in the tests/ directory."
         )
-    test_conv.run()
+    _run_conversation_with_retry(test_conv, "test-agent")
     if log_dir:
         _save_agent_log(test_conv, log_dir, "phase2_test")
 
@@ -1876,11 +1948,23 @@ def run_tdd_pipeline(
     stub_modules = []
     for sf in manifest.stub_files:
         p = Path(sf)
-        # Convert path like "kvstore/stubs.py" to "kvstore.stubs"
+        # Convert path like "calculator/config.py" to "calculator.config"
         parts = list(p.parts)
         if parts[-1].endswith(".py"):
             parts[-1] = parts[-1][:-3]
-        stub_modules.append(".".join(parts))
+        # "calculator/__init__" → "calculator"
+        if parts and parts[-1] == "__init__":
+            parts = parts[:-1]
+        if parts:
+            stub_modules.append(".".join(parts))
+    # Deduplicate while preserving order
+    seen = set()
+    unique_modules = []
+    for m in stub_modules:
+        if m not in seen:
+            seen.add(m)
+            unique_modules.append(m)
+    stub_modules = unique_modules
     smoke_imports = "; ".join(f"import {m}" for m in stub_modules) if stub_modules else "print('no stubs')"
     smoke_cmd = f"python3 -c '{smoke_imports}; print(\"smoke ok\")'"
 
@@ -1901,7 +1985,7 @@ def run_tdd_pipeline(
         f"After implementing, run this smoke test:\n  {smoke_cmd}\n"
         f"Do NOT run pytest."
     )
-    code_conv.run()
+    _run_conversation_with_retry(code_conv, "code-agent")
     if log_dir:
         _save_agent_log(code_conv, log_dir, "phase3_code_smoke")
 
@@ -1941,7 +2025,7 @@ def run_tdd_pipeline(
             all_debug_form_sets.append(form_set)
 
             if not form_set.forms:
-                print("  No forms filled — cannot proceed with debug")
+                print("  No forms filled after all tool-call retries — cannot proceed with debug")
                 break
 
             # Phase 4.6: Code Agent fixes with forms (with rejection loop)
@@ -2019,7 +2103,7 @@ def run_tdd_pipeline(
             f"{modify_hint}"
             "Run `pytest tests/test_blackbox_auto.py -v` to verify they pass."
         )
-        bb_write_conv.run()
+        _run_conversation_with_retry(bb_write_conv, "blackbox-write")
         if log_dir:
             _save_agent_log(bb_write_conv, log_dir, "phase5a_bb_write")
 
@@ -2150,7 +2234,7 @@ def _run_debug_analysis(
     debug_agent = create_debug_agent(llm)
     debug_conv = Conversation(agent=debug_agent, workspace=str(workspace))
     debug_conv.send_message(debug_prompt)
-    debug_conv.run()
+    _run_conversation_with_retry(debug_conv, "debug-agent")
 
     # Ensure probes are cleaned up
     cleaned = instrumentor.remove_all_probes()
@@ -2199,11 +2283,11 @@ def _run_debug_form_analysis(
     log_dir: Path | None,
     round_num: int = 1,
 ) -> DebugFormSet:
-    """Phase 4.5: Test Agent fills Debug Forms for each failing test."""
-    print(f"[TDD] Phase 4.5: Debug Form Analysis (round {round_num})")
+    """Phase 4.5: Test Agent fills Debug Forms for each failing test.
 
-    # Reset form executor for this round
-    reset_debug_form_executor(workspace)
+    Retries if the LLM's tool call is not recognized by the SDK (treated as text).
+    """
+    print(f"[TDD] Phase 4.5: Debug Form Analysis (round {round_num})")
 
     # Build failure summary for the analyst
     failing = [r for r in test_results.per_test if r.status in ("failed", "error")]
@@ -2225,9 +2309,7 @@ def _run_debug_form_analysis(
             f"Re-analyze from a DIFFERENT angle. Do NOT repeat the same guesses.\n"
         )
 
-    analyst_agent = create_test_agent_analyst(llm)
-    analyst_conv = Conversation(agent=analyst_agent, workspace=str(workspace))
-    analyst_conv.send_message(
+    base_prompt = (
         f"Analyze these test failures and fill Debug Forms.\n\n"
         f"{failure_text}\n"
         f"## Full Test Output\n```\n{test_results.output[:4000]}\n```\n"
@@ -2237,15 +2319,56 @@ def _run_debug_form_analysis(
         f"Use batch_fill if many tests fail for the same root cause.\n"
         f"Call submit when done."
     )
-    analyst_conv.run()
-    if log_dir:
-        _save_agent_log(analyst_conv, log_dir, f"phase4_5_analyst_round{round_num}")
 
-    # Collect forms from executor
-    executor = get_debug_form_executor(workspace)
-    form_set = executor.form_set
-    flagged = sum(1 for f in form_set.forms if f.flagged_as_test_bug)
-    print(f"  Forms: {len(form_set.forms)} filled, {flagged} flagged as test bugs")
+    last_agent_text = ""
+    for tool_attempt in range(1, MAX_TOOL_CALL_RETRIES + 2):  # +2 because range is exclusive
+        # Reset form executor for each attempt
+        reset_debug_form_executor(workspace)
+
+        analyst_agent = create_test_agent_analyst(llm)
+        analyst_conv = Conversation(agent=analyst_agent, workspace=str(workspace))
+
+        if tool_attempt == 1:
+            analyst_conv.send_message(base_prompt)
+        else:
+            # Retry with context about the failed tool call
+            retry_hint = (
+                f"## IMPORTANT: Tool Call Retry (attempt {tool_attempt})\n"
+                f"Your previous response was NOT recognized as a tool call.\n"
+                f"The debug_form_tool was NOT invoked. Your text output was:\n"
+                f"```\n{last_agent_text[:1500]}\n```\n\n"
+                f"You MUST use the debug_form_tool properly. Call it as a tool, "
+                f"not as text. Use command='fill' or command='batch_fill'.\n"
+                f"After filling forms, use command='submit'.\n\n"
+            )
+            analyst_conv.send_message(retry_hint + base_prompt)
+
+        _run_conversation_with_retry(analyst_conv, f"analyst-agent-attempt{tool_attempt}")
+        if log_dir:
+            _save_agent_log(analyst_conv, log_dir, f"phase4_5_analyst_round{round_num}_attempt{tool_attempt}")
+
+        # Check if forms were filled
+        executor = get_debug_form_executor(workspace)
+        form_set = executor.form_set
+        flagged = sum(1 for f in form_set.forms if f.flagged_as_test_bug)
+
+        if form_set.forms:
+            print(f"  Forms: {len(form_set.forms)} filled, {flagged} flagged as test bugs")
+            return form_set
+
+        # No forms — extract what the agent said for retry context
+        last_agent_text = _extract_agent_text_messages(analyst_conv)
+        finish_msg = _extract_finish_message(analyst_conv)
+        if finish_msg:
+            last_agent_text = finish_msg + "\n" + last_agent_text
+
+        if tool_attempt <= MAX_TOOL_CALL_RETRIES:
+            print(f"  [tool-call-retry] Attempt {tool_attempt}/{MAX_TOOL_CALL_RETRIES + 1}: "
+                  f"0 forms filled, tool call not recognized. Retrying...")
+        else:
+            print(f"  Tool call retries exhausted ({MAX_TOOL_CALL_RETRIES + 1} attempts): 0 forms filled")
+
+    # All retries failed — return empty form set
     return form_set
 
 
@@ -2284,7 +2407,7 @@ def _run_debug_fix(
         f"Run failing tests individually with `pytest <test_id> -v` to verify fixes.\n"
         f"If ALL hypotheses are wrong, output [REJECT] reason: ... with [COUNTER_EVIDENCE] ..."
     )
-    fix_conv.run()
+    _run_conversation_with_retry(fix_conv, "fix-agent")
     if log_dir:
         _save_agent_log(fix_conv, log_dir, f"phase4_6_fix_round{round_num}")
 
@@ -2340,7 +2463,7 @@ def _run_anticheat(
         f"Write variant tests with DIFFERENT inputs to {output_file}.\n"
         f"Run `pytest {output_file} -v` to verify they pass."
     )
-    anticheat_conv.run()
+    _run_conversation_with_retry(anticheat_conv, "anticheat-agent")
     if log_dir:
         _save_agent_log(anticheat_conv, log_dir, f"phase4_7_anticheat_round{round_num}")
 
@@ -2366,6 +2489,25 @@ def _identify_flipped_tests(
         r.test_id for r in after.per_test if r.status == "passed"
     }
     return sorted(before_failing & after_passing)
+
+
+def _extract_agent_text_messages(conversation: Conversation) -> str:
+    """Extract text messages from agent (non-tool-call responses)."""
+    from openhands.sdk.event import ActionEvent
+    texts = []
+    try:
+        for event in conversation.state.events:
+            if isinstance(event, ActionEvent):
+                action = event.action
+                # MessageAction has a 'message' or 'content' field
+                cls_name = action.__class__.__name__
+                if cls_name == "MessageAction":
+                    msg = getattr(action, "message", "") or getattr(action, "content", "") or ""
+                    if msg:
+                        texts.append(str(msg)[:2000])
+    except Exception:
+        pass
+    return "\n---\n".join(texts)
 
 
 def _extract_finish_message(conversation: Conversation) -> str:

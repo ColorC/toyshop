@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, TYPE_CHECKING
 
+from openhands.sdk import Message, TextContent
+
 if TYPE_CHECKING:
     from openhands.sdk import LLM
     from toyshop.debug_hypothesis import DebugHypothesis
@@ -107,7 +109,7 @@ def evaluate_soft_assertion(
     )
 
     response = llm.completion(
-        messages=[{"role": "user", "content": prompt}],
+        messages=[Message(role="user", content=[TextContent(text=prompt)])],
     )
     content = response.choices[0].message.content or ""
 

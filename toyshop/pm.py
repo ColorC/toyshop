@@ -354,10 +354,14 @@ def _create_wiki_version(
 ) -> None:
     """Create a wiki version + test suite after successful TDD."""
     import re as _re
-    from toyshop.storage.database import init_database, get_latest_snapshot, create_project, get_db
+    from toyshop.storage.database import (
+        init_database, get_latest_snapshot, create_project, get_db,
+        save_architecture_from_design,
+    )
     from toyshop.storage.wiki import (
         create_version, save_test_suite, extract_test_metadata, log_event,
     )
+    from toyshop.tdd_pipeline import _parse_design_modules, _parse_design_interfaces
 
     db_path = workspace / ".toyshop" / "architecture.db"
     init_database(db_path)
@@ -375,7 +379,47 @@ def _create_wiki_version(
         proj = create_project(batch.project_name, str(workspace))
         project_id = proj["id"]
 
-    latest_snap = get_latest_snapshot(project_id)
+    # Parse design.md → structured snapshot of modules + interfaces
+    snapshot_id = None
+    design_path = batch.batch_dir / "openspec" / "design.md"
+    if design_path.exists():
+        design_text = design_path.read_text(encoding="utf-8")
+        modules = _parse_design_modules(design_text)
+        interfaces = _parse_design_interfaces(design_text)
+        # Convert to DB format (add moduleId linkage)
+        mod_name_to_id: dict[str, str] = {}
+        db_modules = []
+        for m in modules:
+            import uuid as _uuid
+            mid = str(_uuid.uuid4())[:8]
+            mod_name_to_id[m.get("name", "")] = mid
+            db_modules.append({
+                "id": mid,
+                "name": m.get("name", ""),
+                "filePath": m.get("filePath", ""),
+                "responsibilities": m.get("responsibilities", []),
+                "dependencies": m.get("dependencies", []),
+            })
+        db_interfaces = []
+        for iface in interfaces:
+            imod = iface.get("module", "")
+            module_id = mod_name_to_id.get(imod, "")
+            db_interfaces.append({
+                "id": str(_uuid.uuid4())[:8],
+                "moduleId": module_id,
+                "name": iface.get("name", ""),
+                "type": "class" if iface.get("signature", "").startswith("class ") else "function",
+                "signature": iface.get("signature", ""),
+            })
+        if db_modules or db_interfaces:
+            snap = save_architecture_from_design(
+                project_id, db_modules, db_interfaces, source="tdd_pipeline",
+            )
+            snapshot_id = snap["id"]
+
+    if snapshot_id is None:
+        latest_snap = get_latest_snapshot(project_id)
+        snapshot_id = latest_snap["id"] if latest_snap else None
 
     # Parse pass/fail from whitebox_output summary line
     passed = failed = 0
@@ -388,7 +432,7 @@ def _create_wiki_version(
 
     version = create_version(
         project_id=project_id,
-        snapshot_id=latest_snap["id"] if latest_snap else None,
+        snapshot_id=snapshot_id,
         change_type="create" if mode == "create" else "modify",
         change_summary=result.summary or f"{passed} passed, {failed} failed",
         change_source="tdd",
@@ -417,8 +461,9 @@ def _create_wiki_version(
         f"v{version.version_number}: {passed} passed, {failed} failed",
         version_id=version.id,
     )
+    snap_info = f", snapshot={snapshot_id[:8]}" if snapshot_id else ""
     print(f"  [wiki] Created version {version.version_number} "
-          f"({len(test_cases)} tests, {len(test_files)} files)")
+          f"({len(test_cases)} tests, {len(test_files)} files{snap_info})")
 
 
 def run_batch_tdd(batch: BatchState, llm: LLM, mode: str = "create") -> TDDResult:

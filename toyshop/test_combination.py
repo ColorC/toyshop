@@ -14,6 +14,8 @@ import textwrap
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from openhands.sdk import Message, TextContent
+
 if TYPE_CHECKING:
     from openhands.sdk import LLM
 
@@ -153,7 +155,7 @@ def generate_variant_test(
     )
 
     response = llm.completion(
-        messages=[{"role": "user", "content": prompt}],
+        messages=[Message(role="user", content=[TextContent(text=prompt)])],
     )
 
     # Extract code from response
@@ -343,7 +345,7 @@ def generate_anticheat_tests_for_flipped(
                     )
                     try:
                         response = llm.completion(
-                            messages=[{"role": "user", "content": prompt}],
+                            messages=[Message(role="user", content=[TextContent(text=prompt)])],
                         )
                         content = response.choices[0].message.content or ""
                         # Extract code

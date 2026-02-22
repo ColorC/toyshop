@@ -309,7 +309,7 @@ class DebugFormExecutor(ToolExecutor):
                 return DebugFormObservation.from_text("Error: batch_pattern required", is_error=True)
             if not action.guessed_cause:
                 return DebugFormObservation.from_text("Error: guessed_cause is REQUIRED", is_error=True)
-            test_ids = [s.strip() for s in (action.batch_test_ids or "").split(",") if s.strip()]
+            test_ids = [s.strip() for s in re.split(r"[,\n]+", action.batch_test_ids or "") if s.strip()]
             if not test_ids:
                 return DebugFormObservation.from_text("Error: batch_test_ids required (comma-separated)", is_error=True)
             form = DebugForm(
