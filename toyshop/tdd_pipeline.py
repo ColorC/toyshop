@@ -138,6 +138,7 @@ class SignatureManifest:
     test_dir: str
     modules: list[dict[str, Any]]
     interfaces: list[dict[str, Any]]
+    skeleton_files: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -525,6 +526,38 @@ def _parse_design_modules(design_md: str) -> list[dict[str, str]]:
     return modules
 
 
+def _build_module_map(modules: list[dict[str, str]]) -> dict[str, str]:
+    """Build short_id → python_import_path mapping from parsed modules.
+
+    Module names come in two formats:
+      Format A: "mdtable.parser" (already a dotted path)
+      Format B: "Calculator Core (`core`)" (display name with backtick ID)
+
+    Returns e.g. {"core": "calculator.core", "exceptions": "calculator.exceptions"}
+    """
+    mapping: dict[str, str] = {}
+    for mod in modules:
+        name = mod.get("name", "")
+        file_path = mod.get("filePath", "")
+        # Format B: extract short ID from backticks
+        m = re.search(r"`(\w[\w-]*)`", name)
+        if m:
+            short_id = m.group(1)
+        elif "." in name:
+            # Format A: "mdtable.parser" → use last segment as ID
+            short_id = name.rsplit(".", 1)[-1]
+        else:
+            short_id = name.lower().replace(" ", "_")
+        if file_path:
+            # "calculator/core.py" → "calculator.core"
+            # "calculator/__init__.py" → "calculator"
+            import_path = file_path.replace(".py", "").replace("/", ".")
+            if import_path.endswith(".__init__"):
+                import_path = import_path[: -len(".__init__")]
+            mapping[short_id] = import_path
+    return mapping
+
+
 def _normalize_signature(name: str, sig: str) -> str:
     """Ensure signature is valid Python: prepend 'def name' if missing."""
     sig = sig.strip()
@@ -615,6 +648,162 @@ def _generate_stub_code(interfaces: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def _generate_test_skeletons(
+    interfaces: list[dict[str, str]],
+    module_map: dict[str, str],
+    workspace: Path,
+    mode: str = "create",
+) -> list[str]:
+    """Generate test skeleton files with correct imports and fixtures.
+
+    Returns list of generated file paths (relative to workspace).
+    """
+    py_ifaces = [i for i in interfaces if _is_python_signature(i["signature"])]
+    if not py_ifaces:
+        return []
+
+    # Group interfaces by module short_id
+    by_module: dict[str, list[dict[str, str]]] = {}
+    for iface in py_ifaces:
+        mod_id = iface.get("module", "").strip()
+        if not mod_id:
+            mod_id = "_misc"
+        by_module.setdefault(mod_id, []).append(iface)
+
+    test_dir = workspace / "tests"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    generated: list[str] = []
+
+    # Collect exception classes for conftest (commonly needed across modules)
+    exc_module_id = None
+    exc_import_path = None
+    exc_classes: list[str] = []
+    for mod_id, ifaces in by_module.items():
+        import_path = module_map.get(mod_id, "")
+        if "exception" in mod_id.lower() or "exception" in import_path.lower():
+            exc_module_id = mod_id
+            exc_import_path = import_path
+            for iface in ifaces:
+                sig = _normalize_signature(iface["name"], iface["signature"])
+                if sig.startswith("class "):
+                    exc_classes.append(iface["name"])
+
+    for mod_id, ifaces in by_module.items():
+        import_path = module_map.get(mod_id, "")
+        if not import_path:
+            continue  # Can't generate skeleton without import path
+
+        # Separate classes and functions
+        classes: dict[str, list[dict[str, str]]] = {}
+        functions: list[dict[str, str]] = []
+        for iface in ifaces:
+            sig = _normalize_signature(iface["name"], iface["signature"])
+            if sig.startswith("class "):
+                classes[iface["name"]] = []
+            elif "self" in sig:
+                if classes:
+                    last_cls = list(classes.keys())[-1]
+                    classes[last_cls].append(iface)
+                else:
+                    functions.append(iface)
+            else:
+                functions.append(iface)
+
+        # Build import names
+        class_names = list(classes.keys())
+        func_names = [f["name"] for f in functions]
+        all_names = class_names + func_names
+        if not all_names:
+            continue
+
+        # Sanitize module ID for filename
+        safe_mod_id = re.sub(r"[^a-zA-Z0-9_]", "_", mod_id)
+        test_file = test_dir / f"test_{safe_mod_id}.py"
+
+        # In modify mode, don't overwrite existing test files
+        if mode == "modify" and test_file.exists():
+            continue
+
+        lines: list[str] = []
+        lines.append(f'"""Tests for {mod_id} module — auto-generated skeleton."""')
+        lines.append("import pytest")
+
+        # Main import
+        lines.append(f"from {import_path} import (")
+        for name in all_names:
+            lines.append(f"    {name},")
+        lines.append(")")
+
+        # Cross-module exception imports (if testing non-exception module)
+        if exc_import_path and mod_id != exc_module_id and exc_classes:
+            lines.append(f"from {exc_import_path} import (")
+            for exc in exc_classes:
+                lines.append(f"    {exc},")
+            lines.append(")")
+
+        lines.append("")
+        lines.append("")
+
+        # Fixtures for classes
+        for cls_name in class_names:
+            fixture_name = _to_snake_case(cls_name)
+            lines.append("@pytest.fixture")
+            lines.append(f"def {fixture_name}():")
+            lines.append(f"    return {cls_name}()")
+            lines.append("")
+            lines.append("")
+
+        # Test classes
+        for cls_name, methods in classes.items():
+            fixture_name = _to_snake_case(cls_name)
+            lines.append(f"class Test{cls_name}:")
+            lines.append(f'    """Tests for {cls_name}."""')
+            lines.append("")
+            if not methods:
+                lines.append(f"    def test_{fixture_name}_creation(self, {fixture_name}):")
+                lines.append(f"        # TODO: test basic creation")
+                lines.append("        pass")
+                lines.append("")
+            else:
+                for method in methods:
+                    m_name = method["name"]
+                    # Strip class prefix: "Calculator.add" → "add"
+                    if "." in m_name:
+                        m_name = m_name.rsplit(".", 1)[-1]
+                    if m_name.startswith("__") and m_name.endswith("__"):
+                        test_name = m_name.strip("_")
+                    else:
+                        test_name = m_name
+                    sig = _normalize_signature(m_name, method["signature"])
+                    # Extract just the params part for the TODO comment
+                    lines.append(f"    def test_{test_name}(self, {fixture_name}):")
+                    lines.append(f"        # TODO: test {sig}")
+                    lines.append("        pass")
+                    lines.append("")
+            lines.append("")
+
+        # Test functions
+        for func in functions:
+            sig = _normalize_signature(func["name"], func["signature"])
+            lines.append(f"def test_{func['name']}():")
+            lines.append(f"    # TODO: test {sig}")
+            lines.append("    pass")
+            lines.append("")
+            lines.append("")
+
+        test_file.write_text("\n".join(lines), encoding="utf-8")
+        generated.append(str(test_file.relative_to(workspace)))
+
+    return generated
+
+
+def _to_snake_case(name: str) -> str:
+    """Convert CamelCase to snake_case."""
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", name)
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
+    return s.lower()
+
+
 def extract_signatures(workspace: Path, mode: str = "create") -> SignatureManifest:
     """Parse openspec/design.md and generate stub files.
 
@@ -680,11 +869,18 @@ def extract_signatures(workspace: Path, mode: str = "create") -> SignatureManife
 
     stub_files = [str(stub_path.relative_to(workspace))]
 
+    # Phase 1.5: Generate test skeletons with correct imports
+    module_map = _build_module_map(modules)
+    skeleton_files = _generate_test_skeletons(
+        interfaces, module_map, workspace, mode=mode,
+    )
+
     return SignatureManifest(
         stub_files=stub_files,
         test_dir="tests",
         modules=modules,
         interfaces=interfaces,
+        skeleton_files=skeleton_files,
     )
 
 
@@ -692,22 +888,24 @@ def extract_signatures(workspace: Path, mode: str = "create") -> SignatureManife
 # Agent prompts
 # =============================================================================
 
-TEST_AGENT_WRITE_PROMPT = """You are a test engineer. Write comprehensive pytest tests based on design documents and code stubs.
+TEST_AGENT_WRITE_PROMPT = """You are a test engineer. Write comprehensive pytest tests by filling in auto-generated test skeletons.
 
 ## Your Workflow
-1. Read openspec/design.md and openspec/spec.md to understand requirements and interfaces
-2. Read the stub files to understand function/class signatures
-3. Write pytest test files in the tests/ directory
-4. Include: unit tests for each interface, edge case tests, integration tests
-5. Tests should import from the stub modules and test the public API
+1. Read the test skeleton files in tests/ — they have correct imports and fixtures already
+2. Read openspec/design.md and openspec/spec.md to understand requirements and interfaces
+3. Fill in the skeleton test methods with real assertions, edge cases, and error handling
+4. You may add NEW test methods and test classes, but reuse the existing imports
+5. Include: unit tests for each interface, edge case tests, integration tests
 
 ## Rules
 - ONLY create/edit files under the tests/ directory
 - Do NOT implement any production code
+- Do NOT change the import statements in skeleton files — they are auto-generated from the contract and are correct
 - Write tests that will initially FAIL (stubs raise NotImplementedError)
 - Use descriptive test names: test_<feature>_<scenario>
 - Include both happy-path and error-handling tests
-- Use pytest fixtures where appropriate
+- Use the fixtures provided in the skeletons
+- You may add new test files (e.g. tests/test_integration.py, tests/test_edge_cases.py) but import from the same modules as the skeletons
 - If you believe IMPLEMENTATION CODE has a bug, do NOT try to edit it.
   Instead, explain in your finish message what is wrong and why.
   The system will route your request to the coding agent for fixing.
@@ -721,18 +919,19 @@ TEST_AGENT_WRITE_MODIFY_PROMPT = """You are a test engineer. Write additional py
 
 ## Context
 This is a MODIFY operation on an existing codebase. Existing tests already cover unchanged interfaces.
-You must preserve all existing test files and only ADD new tests for the changed parts.
+New test skeletons have been generated for changed/new interfaces with correct imports.
 
 ## Your Workflow
-1. Read openspec/design.md and openspec/spec.md to understand the CHANGES
-2. Read existing test files in tests/ to understand what's already covered
-3. Read the stub/code files to understand new/changed function signatures
-4. Write NEW test files for changed interfaces (e.g. tests/test_<feature>_change.py)
-5. Do NOT modify existing test files unless they import changed signatures
+1. Read the NEW test skeleton files in tests/ — they have correct imports and fixtures
+2. Read openspec/design.md and openspec/spec.md to understand the CHANGES
+3. Read existing test files in tests/ to understand what's already covered
+4. Fill in the skeleton test methods with real assertions
+5. You may add new test methods, but reuse the existing imports from skeletons
 
 ## Rules
 - ONLY create/edit files under the tests/ directory
 - Do NOT implement any production code
+- Do NOT change the import statements in skeleton files — they are correct
 - PRESERVE all existing test files — do not delete or rewrite them
 - Focus on testing NEW and CHANGED interfaces only
 - Use descriptive test names: test_<feature>_<scenario>
@@ -1572,6 +1771,8 @@ def run_tdd_pipeline(
     manifest = extract_signatures(workspace, mode=mode)
     print(f"  Stubs: {manifest.stub_files}")
     print(f"  Interfaces: {len(manifest.interfaces)}")
+    if manifest.skeleton_files:
+        print(f"  Skeletons: {manifest.skeleton_files}")
     if mode == "modify":
         print(f"  Mode: modify (preserving existing code)")
 
@@ -1588,6 +1789,7 @@ def run_tdd_pipeline(
     test_conv = Conversation(agent=test_agent, workspace=str(workspace))
 
     stub_list = "\n".join(f"  - {f}" for f in manifest.stub_files)
+    skeleton_list = "\n".join(f"  - {f}" for f in manifest.skeleton_files)
     modify_hint = ""
     if mode == "modify":
         modify_hint = (
@@ -1595,13 +1797,25 @@ def run_tdd_pipeline(
             "Only write tests for NEW and CHANGED interfaces as described in the design docs.\n"
             "Preserve all existing test files.\n"
         )
-    test_conv.send_message(
-        f"Write comprehensive pytest tests for this project.\n\n"
-        f"Design documents are in openspec/ directory.\n"
-        f"Stub files with signatures:\n{stub_list}\n"
-        f"{modify_hint}\n"
-        f"Create test files in the tests/ directory."
-    )
+    if skeleton_list:
+        test_conv.send_message(
+            f"Fill in the test skeletons for this project.\n\n"
+            f"Test skeletons with correct imports and fixtures:\n{skeleton_list}\n\n"
+            f"Design documents are in openspec/ directory.\n"
+            f"Stub files with signatures:\n{stub_list}\n"
+            f"{modify_hint}\n"
+            f"Read the skeleton files first, then fill in test method bodies with real assertions.\n"
+            f"You may add extra test files (e.g. test_integration.py, test_edge_cases.py) "
+            f"but use the same import paths as the skeletons."
+        )
+    else:
+        test_conv.send_message(
+            f"Write comprehensive pytest tests for this project.\n\n"
+            f"Design documents are in openspec/ directory.\n"
+            f"Stub files with signatures:\n{stub_list}\n"
+            f"{modify_hint}\n"
+            f"Create test files in the tests/ directory."
+        )
     test_conv.run()
     if log_dir:
         _save_agent_log(test_conv, log_dir, "phase2_test")
