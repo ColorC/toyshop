@@ -21,6 +21,7 @@ appropriate agent (e.g., code agent -> test fix agent for test bugs).
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import subprocess
@@ -113,6 +114,122 @@ MAX_DEBUG_FORM_RETRIES = 3   # max outer debug loop iterations
 MAX_REJECTION_RETRIES = 2    # max Code Agent → Test Agent rejection ping-pongs
 MAX_CONV_RETRIES = 3         # max retries for gateway 502 errors
 MAX_TOOL_CALL_RETRIES = 2   # max retries when analyst tool call not recognized
+MAX_TEST_QUALITY_FIX_RETRIES = 2
+
+
+def _truncate_text(text: str, limit: int = 1600) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n... (truncated)"
+
+
+def _strip_docstring_stmt(body: list[ast.stmt]) -> list[ast.stmt]:
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        return body[1:]
+    return body
+
+
+def _is_notimplemented_raise(stmt: ast.stmt) -> bool:
+    if not isinstance(stmt, ast.Raise) or stmt.exc is None:
+        return False
+    exc = stmt.exc
+    if isinstance(exc, ast.Call):
+        fn = exc.func
+    else:
+        fn = exc
+    if isinstance(fn, ast.Name) and fn.id == "NotImplementedError":
+        return True
+    if isinstance(fn, ast.Attribute) and fn.attr == "NotImplementedError":
+        return True
+    return False
+
+
+def _is_pytest_skip_call(stmt: ast.stmt) -> bool:
+    if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+        return False
+    fn = stmt.value.func
+    return (
+        isinstance(fn, ast.Attribute)
+        and isinstance(fn.value, ast.Name)
+        and fn.value.id == "pytest"
+        and fn.attr in {"skip", "xfail"}
+    )
+
+
+def _find_test_placeholder_issues(test_file: Path, rel_path: str) -> list[str]:
+    issues: list[str] = []
+    try:
+        source = test_file.read_text(encoding="utf-8")
+    except Exception as e:
+        return [f"{rel_path}: failed to read test file ({e})"]
+
+    try:
+        tree = ast.parse(source, filename=rel_path)
+    except SyntaxError as e:
+        return [f"{rel_path}:{e.lineno or 1} syntax error: {e.msg}"]
+
+    for i, line in enumerate(source.splitlines(), start=1):
+        if re.search(r"#\s*TODO\b", line):
+            issues.append(f"{rel_path}:{i} contains TODO marker")
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test_"):
+            continue
+        body = _strip_docstring_stmt(node.body)
+        test_id = f"{rel_path}::{node.name}"
+        if not body:
+            issues.append(f"{test_id} has empty body")
+            continue
+        if len(body) == 1 and isinstance(body[0], ast.Pass):
+            issues.append(f"{test_id} uses placeholder `pass`")
+            continue
+        if len(body) == 1 and _is_notimplemented_raise(body[0]):
+            issues.append(f"{test_id} raises NotImplementedError placeholder")
+            continue
+        if any(_is_notimplemented_raise(stmt) for stmt in body):
+            issues.append(f"{test_id} contains NotImplementedError placeholder")
+        if any(_is_pytest_skip_call(stmt) for stmt in body):
+            issues.append(f"{test_id} uses pytest.skip/xfail placeholder")
+    return issues
+
+
+def _run_pytest_collect_only(workspace: Path, timeout: int = 120) -> tuple[bool, str]:
+    cmd = ["python3", "-m", "pytest", "tests/", "--collect-only", "-q"]
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"{' '.join(cmd)} timed out after {timeout}s"
+    except Exception as e:
+        return False, f"{' '.join(cmd)} execution error: {e}"
+    output = (result.stdout + "\n" + result.stderr).strip()
+    return result.returncode == 0, output
+
+
+def _test_generation_quality_issues(workspace: Path, test_files: list[str]) -> list[str]:
+    issues: list[str] = []
+    for rel in sorted(test_files):
+        path = workspace / rel
+        if not path.exists():
+            issues.append(f"{rel} is missing")
+            continue
+        issues.extend(_find_test_placeholder_issues(path, rel))
+    collect_ok, collect_output = _run_pytest_collect_only(workspace)
+    if not collect_ok:
+        issues.append("pytest --collect-only failed:\n" + _truncate_text(collect_output, 2200))
+    return issues
 
 
 def _run_conversation_with_retry(conv: Conversation, label: str = "") -> None:
@@ -983,11 +1100,18 @@ TEST_AGENT_WRITE_PROMPT = """You are a test engineer. Write comprehensive pytest
 - ONLY create/edit files under the tests/ directory
 - Do NOT implement any production code
 - Do NOT change the import statements in skeleton files — they are auto-generated from the contract and are correct
-- Write tests that will initially FAIL (stubs raise NotImplementedError)
 - Use descriptive test names: test_<feature>_<scenario>
 - Include both happy-path and error-handling tests
 - Use the fixtures provided in the skeletons
 - You may add new test files (e.g. tests/test_integration.py, tests/test_edge_cases.py) but import from the same modules as the skeletons
+- Every generated test must be executable code with real assertions.
+- NEVER leave placeholders in test bodies:
+  - no `pass`
+  - no `# TODO`
+  - no `raise NotImplementedError(...)`
+  - no `pytest.skip()` / `pytest.xfail()`
+- Ensure test collection works by running:
+  - `python3 -m pytest tests/ --collect-only -q`
 - If you believe IMPLEMENTATION CODE has a bug, do NOT try to edit it.
   Instead, explain in your finish message what is wrong and why.
   The system will route your request to the coding agent for fixing.
@@ -1018,6 +1142,14 @@ New test skeletons have been generated for changed/new interfaces with correct i
 - Focus on testing NEW and CHANGED interfaces only
 - Use descriptive test names: test_<feature>_<scenario>
 - Include both happy-path and error-handling tests for new functionality
+- Every generated test must be executable code with real assertions.
+- NEVER leave placeholders in test bodies:
+  - no `pass`
+  - no `# TODO`
+  - no `raise NotImplementedError(...)`
+  - no `pytest.skip()` / `pytest.xfail()`
+- Ensure test collection works by running:
+  - `python3 -m pytest tests/ --collect-only -q`
 - If you believe IMPLEMENTATION CODE has a bug, do NOT try to edit it.
   Instead, explain in your finish message what is wrong and why.
 
@@ -1922,11 +2054,15 @@ def run_tdd_pipeline(
 
     # Collect test files
     test_dir = workspace / "tests"
-    test_files = sorted(
-        str(f.relative_to(workspace))
-        for f in test_dir.rglob("test_*.py")
-        if f.name != "test_blackbox_auto.py"
-    )
+
+    def _collect_whitebox_test_files() -> list[str]:
+        return sorted(
+            str(f.relative_to(workspace))
+            for f in test_dir.rglob("test_*.py")
+            if f.name != "test_blackbox_auto.py"
+        )
+
+    test_files = _collect_whitebox_test_files()
     print(f"  Test files created: {test_files}")
 
     if not test_files:
@@ -1935,6 +2071,60 @@ def run_tdd_pipeline(
             stub_files=manifest.stub_files,
             summary="Test Agent produced no test files",
         )
+
+    # Quality gate: generated tests must be executable (no placeholders/import breaks).
+    quality_fix_round = 0
+    while True:
+        quality_issues = _test_generation_quality_issues(workspace, test_files)
+        if not quality_issues:
+            break
+
+        print(f"  [GATE] Test quality issues detected: {len(quality_issues)}")
+        for item in quality_issues[:8]:
+            print(f"    - {item}")
+
+        if quality_fix_round >= MAX_TEST_QUALITY_FIX_RETRIES:
+            return TDDResult(
+                success=False,
+                stub_files=manifest.stub_files,
+                test_files=test_files,
+                summary=(
+                    "Test generation quality gate failed after retries: "
+                    + _truncate_text(" | ".join(quality_issues), 800)
+                ),
+            )
+
+        quality_fix_round += 1
+        quality_agent = create_test_agent_write(llm, mode=mode)
+        quality_conv = Conversation(agent=quality_agent, workspace=str(workspace))
+        issue_lines = "\n".join(f"- {msg}" for msg in quality_issues[:20])
+        quality_conv.send_message(
+            "Fix the generated tests to satisfy the test quality gate.\n\n"
+            "Issues to fix:\n"
+            f"{issue_lines}\n\n"
+            "Required outcomes:\n"
+            "1. Remove all placeholders from test bodies (`pass`, `# TODO`, "
+            "`raise NotImplementedError(...)`, `pytest.skip/xfail`).\n"
+            "2. Keep import paths and references valid.\n"
+            "3. Ensure `python3 -m pytest tests/ --collect-only -q` exits successfully.\n"
+            "4. Edit ONLY files under tests/.\n"
+        )
+        _run_conversation_with_retry(quality_conv, f"test-agent-quality-fix-{quality_fix_round}")
+        if log_dir:
+            _save_agent_log(quality_conv, log_dir, f"phase2_test_quality_fix_round{quality_fix_round}")
+
+        quality_violations = _detect_boundary_violations(quality_conv, "test")
+        if quality_violations:
+            code_paths = [v.target_path for v in quality_violations]
+            print(f"  [BOUNDARY] Test quality fix attempted to edit code file(s): {code_paths}")
+
+        test_files = _collect_whitebox_test_files()
+        if not test_files:
+            return TDDResult(
+                success=False,
+                stub_files=manifest.stub_files,
+                summary="Test quality fix removed all test files",
+            )
 
     # ── Phase 5 (early): Check if spec.md has scenarios for black-box ──
     spec_path = workspace / "openspec" / "spec.md"

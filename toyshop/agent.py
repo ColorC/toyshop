@@ -23,6 +23,12 @@ from toyshop.tools import (
     GenerateTasksTool,
     GenerateSpecTool,
 )
+from toyshop.tools.analyze_input import AnalyzeInputAction, TOOL_DESCRIPTION as ANALYZE_INPUT_DESC
+from toyshop.tools.generate_proposal import GenerateProposalAction, TOOL_DESCRIPTION as GENERATE_PROPOSAL_DESC
+from toyshop.tools.design_modules import DesignModulesAction, TOOL_DESCRIPTION as DESIGN_MODULES_DESC
+from toyshop.tools.design_interfaces import DesignInterfacesAction, TOOL_DESCRIPTION as DESIGN_INTERFACES_DESC
+from toyshop.tools.generate_tasks import GenerateTasksAction, TOOL_DESCRIPTION as GENERATE_TASKS_DESC
+from toyshop.tools.generate_spec import GenerateSpecAction, TOOL_DESCRIPTION as GENERATE_SPEC_DESC
 
 
 # System prompt for ToyShop agent
@@ -345,14 +351,13 @@ def run_toyshop_workflow(
     base_context = f"Project: {project_name}\nRequirements: {user_input}"
 
     # Step 1: analyze_input
-    from toyshop.tools.analyze_input import AnalyzeInputTool
     result = chat_with_tool(
         llm=llm,
         system_prompt="You are a software requirements analyst. Analyze the user's requirements and call the analyze_input tool.",
         user_content=base_context,
         tool_name="analyze_input",
-        tool_description=AnalyzeInputTool.description,
-        tool_parameters=AnalyzeInputTool.action_schema.model_json_schema(),
+        tool_description=ANALYZE_INPUT_DESC,
+        tool_parameters=AnalyzeInputAction.model_json_schema(),
     )
     if result:
         ctx["analysis"] = {
@@ -361,44 +366,41 @@ def run_toyshop_workflow(
         }
 
     # Step 2: generate_proposal
-    from toyshop.tools.generate_proposal import GenerateProposalTool
     result = chat_with_tool(
         llm=llm,
         system_prompt="You are a software architect. Generate a detailed project proposal. Fill in ALL required fields: project_name, background, problem, goals.",
         user_content=f"{base_context}\n\nAnalysis: {json.dumps(ctx.get('analysis', {}), ensure_ascii=False)}",
         tool_name="generate_proposal",
-        tool_description=GenerateProposalTool.description,
-        tool_parameters=GenerateProposalTool.action_schema.model_json_schema(),
+        tool_description=GENERATE_PROPOSAL_DESC,
+        tool_parameters=GenerateProposalAction.model_json_schema(),
     )
     if result:
         ctx["proposal"] = result
         ctx["proposal_id"] = f"proposal-{uuid.uuid4().hex[:8]}"
 
     # Step 3: design_modules
-    from toyshop.tools.design_modules import DesignModulesTool
     proposal_summary = json.dumps(ctx.get("proposal", {}), ensure_ascii=False)[:2000]
     result = chat_with_tool(
         llm=llm,
         system_prompt="You are a software architect. Design the system architecture with modules. Include requirement, modules with id/name/description/responsibilities/dependencies/file_path.",
         user_content=f"{base_context}\n\nProposal: {proposal_summary}",
         tool_name="design_modules",
-        tool_description=DesignModulesTool.description,
-        tool_parameters=DesignModulesTool.action_schema.model_json_schema(),
+        tool_description=DESIGN_MODULES_DESC,
+        tool_parameters=DesignModulesAction.model_json_schema(),
     )
     if result:
         ctx["design"] = result
         ctx["design_id"] = f"design-{uuid.uuid4().hex[:8]}"
 
     # Step 4: design_interfaces
-    from toyshop.tools.design_interfaces import DesignInterfacesTool
     design_summary = json.dumps(ctx.get("design", {}), ensure_ascii=False)[:2000]
     result = chat_with_tool(
         llm=llm,
         system_prompt="You are a software architect. Define interfaces and data models for the modules. Each interface needs id, name, type, signature, description, module_id.",
         user_content=f"{base_context}\n\nDesign: {design_summary}",
         tool_name="design_interfaces",
-        tool_description=DesignInterfacesTool.description,
-        tool_parameters=DesignInterfacesTool.action_schema.model_json_schema(),
+        tool_description=DESIGN_INTERFACES_DESC,
+        tool_parameters=DesignInterfacesAction.model_json_schema(),
     )
     if result:
         if "design" not in ctx:
@@ -407,28 +409,26 @@ def run_toyshop_workflow(
         ctx["design"]["data_models"] = result.get("data_models", [])
 
     # Step 5: generate_tasks
-    from toyshop.tools.generate_tasks import GenerateTasksTool
     result = chat_with_tool(
         llm=llm,
         system_prompt="You are a project manager. Break down the design into implementation tasks. Each task needs id (X.Y format), title, description, dependencies, estimated_complexity, assigned_module.",
         user_content=f"{base_context}\n\nDesign: {design_summary}",
         tool_name="generate_tasks",
-        tool_description=GenerateTasksTool.description,
-        tool_parameters=GenerateTasksTool.action_schema.model_json_schema(),
+        tool_description=GENERATE_TASKS_DESC,
+        tool_parameters=GenerateTasksAction.model_json_schema(),
     )
     if result:
         ctx["tasks"] = result.get("tasks", [])
 
     # Step 6: generate_spec
-    from toyshop.tools.generate_spec import GenerateSpecTool
     tasks_summary = json.dumps(ctx.get("tasks", []), ensure_ascii=False)[:2000]
     result = chat_with_tool(
         llm=llm,
         system_prompt="You are a QA engineer. Create test scenarios in Given-When-Then format. Each scenario needs id, name, given, when, then.",
         user_content=f"{base_context}\n\nTasks: {tasks_summary}",
         tool_name="generate_spec",
-        tool_description=GenerateSpecTool.description,
-        tool_parameters=GenerateSpecTool.action_schema.model_json_schema(),
+        tool_description=GENERATE_SPEC_DESC,
+        tool_parameters=GenerateSpecAction.model_json_schema(),
     )
     if result:
         ctx["spec"] = {"scenarios": result.get("scenarios", [])}

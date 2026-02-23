@@ -37,6 +37,7 @@ from toyshop.tdd_pipeline import (
 # PM System
 from toyshop.pm import (
     run_batch,
+    run_batch_phased,
     resume_batch,
     BatchState,
     TaskState,
@@ -75,6 +76,7 @@ __all__ = [
     "TDDResult",
     # PM System
     "run_batch",
+    "run_batch_phased",
     "resume_batch",
     "BatchState",
     "TaskState",

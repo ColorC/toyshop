@@ -38,6 +38,13 @@ from toyshop.spec_evolution import (
     evolve_proposal, evolve_design, evolve_tasks, evolve_spec,
     verify_evolution,
 )
+from toyshop.research_agent import (
+    ResearchPlan,
+    generate_kickoff_plan,
+    default_research_plan,
+)
+
+ALLOWED_RESEARCH_TRIGGERS = {"kickoff_mvp_sota", "deadlock_resolution"}
 
 
 # =============================================================================
@@ -79,6 +86,10 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _now_compact() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
 def _write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -118,6 +129,222 @@ def _save_task_json(task: TaskState) -> None:
         "assigned_module": task.assigned_module,
     }
     _write_json(task.task_dir / "task.json", data)
+
+
+def _append_stage_event(
+    batch: BatchState,
+    *,
+    stage: str,
+    event: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    """Append a stage event line for phased pipeline observability."""
+    event_path = batch.batch_dir / "stage_events.jsonl"
+    payload = {
+        "timestamp": _now_iso(),
+        "stage": stage,
+        "event": event,
+        "details": details or {},
+    }
+    with event_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _write_stage_checkpoint(
+    batch: BatchState,
+    *,
+    current_stage: str,
+    gate_passed: bool,
+    artifact_refs: list[str] | None = None,
+) -> None:
+    """Write stage checkpoint state (MVP/SOTA progression)."""
+    checkpoint = {
+        "batch_id": batch.batch_id,
+        "current_stage": current_stage,  # mvp | mvp_uploaded | sota | done
+        "stage_gate_passed": gate_passed,
+        "stage_artifact_refs": artifact_refs or [],
+        "updated_at": _now_iso(),
+    }
+    _write_json(batch.batch_dir / "stage_checkpoint.json", checkpoint)
+
+
+def _write_clarification_artifact(batch: BatchState, clarified_requirement: str) -> None:
+    """Persist requirement clarification artifact for phased traceability."""
+    lines = [
+        "# Clarification",
+        "",
+        "## Clarified Requirement",
+        clarified_requirement.strip(),
+        "",
+        f"_updated_at: {_now_iso()}_",
+    ]
+    (batch.batch_dir / "clarification.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def _append_quality_gate(
+    batch: BatchState,
+    *,
+    stage: str,
+    gate: str,
+    passed: bool,
+    details: dict[str, Any] | None = None,
+) -> None:
+    """Append a quality gate result for phased observability and auditing."""
+    gates_path = batch.batch_dir / "quality_gates.json"
+    gates: list[dict[str, Any]] = []
+    if gates_path.exists():
+        prev = _read_json(gates_path)
+        if isinstance(prev, list):
+            gates = prev
+
+    gates.append({
+        "timestamp": _now_iso(),
+        "stage": stage,
+        "gate": gate,
+        "passed": passed,
+        "details": details or {},
+    })
+    _write_json(gates_path, gates)
+
+
+def _write_exit_conditions(
+    batch: BatchState,
+    *,
+    current_stage: str,
+    passed: bool,
+    reasons: list[str] | None = None,
+    required_artifacts: list[str] | None = None,
+) -> None:
+    """Persist exit condition checks for phased completion/failure paths."""
+    required = required_artifacts or []
+    artifact_checks = []
+    for rel_path in required:
+        artifact_checks.append({
+            "path": rel_path,
+            "exists": (batch.batch_dir / rel_path).exists(),
+        })
+
+    payload = {
+        "run_id": batch.batch_id,
+        "current_stage": current_stage,
+        "passed": passed,
+        "status": batch.status,
+        "reasons": reasons or [],
+        "artifact_checks": artifact_checks,
+        "updated_at": _now_iso(),
+    }
+    _write_json(batch.batch_dir / "exit_conditions.json", payload)
+
+
+def _save_research_artifacts(
+    batch: BatchState,
+    plan: ResearchPlan,
+    *,
+    trigger_type: str,
+    timebox_minutes: int,
+    enable_external_research: bool,
+    problem_statement: str | None = None,
+    local_attempt_summary: str = "",
+) -> None:
+    """Persist research request/result artifacts for audit and replay."""
+    research_dir = batch.batch_dir / "research"
+    research_dir.mkdir(parents=True, exist_ok=True)
+
+    request_problem = problem_statement
+    if request_problem is None:
+        request_problem = (batch.batch_dir / "requirements.md").read_text(encoding="utf-8")
+
+    request_payload = {
+        "trigger_type": trigger_type,
+        "problem_statement": request_problem,
+        "local_attempt_summary": local_attempt_summary,
+        "constraints": {
+            "project_type": batch.project_type,
+            "timebox_minutes": timebox_minutes,
+            "enable_external_research": enable_external_research,
+        },
+        "created_at": _now_iso(),
+    }
+    artifact_prefix = f"{_now_compact()}_{trigger_type}"
+    result_payload = plan.to_dict()
+
+    # Keep legacy paths for compatibility (latest request/result)
+    _write_json(research_dir / "request.json", request_payload)
+    _write_json(research_dir / "result.json", result_payload)
+    # Append-only artifacts for replay/audit
+    _write_json(research_dir / f"{artifact_prefix}_request.json", request_payload)
+    _write_json(research_dir / f"{artifact_prefix}_result.json", result_payload)
+
+    lines = [
+        "# Research Plan",
+        "",
+        f"- trigger_type: `{plan.trigger_type}`",
+        f"- recommended_option: `{plan.recommended_option}`",
+        f"- generated_at: `{request_payload['created_at']}`",
+        "",
+        "## MVP Option",
+        plan.mvp_option,
+        "",
+        "## SOTA Option",
+        plan.sota_option,
+        "",
+        "## MVP Scope",
+    ]
+    for item in plan.mvp_scope:
+        lines.append(f"- {item}")
+    lines.extend(["", "## Tradeoffs"])
+    for item in plan.tradeoffs:
+        lines.append(f"- {item}")
+    lines.extend(["", "## Adoption Plan"])
+    for item in plan.adoption_plan:
+        lines.append(f"- {item}")
+    if plan.external_summary:
+        lines.extend(["", "## External Summary", plan.external_summary])
+    if plan.sources:
+        lines.extend(["", "## Sources"])
+        for s in plan.sources:
+            lines.append(f"- {s}")
+
+    summary_text = "\n".join(lines)
+    (research_dir / "summary.md").write_text(summary_text, encoding="utf-8")
+    (research_dir / f"{artifact_prefix}_summary.md").write_text(summary_text, encoding="utf-8")
+
+    history_path = research_dir / "history.jsonl"
+    with history_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "timestamp": request_payload["created_at"],
+            "trigger_type": trigger_type,
+            "artifact_prefix": artifact_prefix,
+            "sources_count": len(plan.sources),
+            "has_external_summary": bool(plan.external_summary),
+        }, ensure_ascii=False) + "\n")
+
+
+def _build_stage_requirement(user_input: str, plan: ResearchPlan, stage: str) -> str:
+    """Build stage-targeted requirement text from research plan."""
+    if stage == "mvp":
+        scope_lines = "\n".join(f"- {s}" for s in plan.mvp_scope) if plan.mvp_scope else "- core happy path"
+        return (
+            f"{user_input.strip()}\n\n"
+            "## Stage Target: MVP\n"
+            f"{plan.mvp_option}\n\n"
+            "## MVP Scope\n"
+            f"{scope_lines}\n\n"
+            "## Execution Rule\n"
+            "Focus on minimal verifiable implementation and tests."
+        )
+    if stage == "sota":
+        tradeoff_lines = "\n".join(f"- {t}" for t in plan.tradeoffs) if plan.tradeoffs else "- n/a"
+        return (
+            f"{user_input.strip()}\n\n"
+            "## Stage Target: SOTA\n"
+            f"{plan.sota_option}\n\n"
+            "## Baseline\n"
+            "MVP has been completed. Improve quality, robustness, and best practices.\n\n"
+            "## Tradeoffs\n"
+            f"{tradeoff_lines}\n"
+        )
+    return user_input.strip()
 
 
 # =============================================================================
@@ -238,6 +465,62 @@ def parse_tasks_md(text: str) -> list[dict[str, Any]]:
 # Core functions
 # =============================================================================
 
+def run_research_planning(
+    batch: BatchState,
+    llm: LLM,
+    *,
+    trigger_type: str = "kickoff_mvp_sota",
+    timebox_minutes: int = 8,
+    enable_external_research: bool = True,
+    problem_statement: str | None = None,
+    local_attempt_summary: str = "",
+) -> ResearchPlan:
+    """Generate research-backed MVP/SOTA plan and persist artifacts."""
+    if trigger_type not in ALLOWED_RESEARCH_TRIGGERS:
+        raise ValueError(f"Unsupported trigger_type: {trigger_type}")
+
+    requirements = (batch.batch_dir / "requirements.md").read_text(encoding="utf-8")
+    query_text = problem_statement if problem_statement is not None else requirements
+    _append_stage_event(
+        batch,
+        stage="research",
+        event="planning_start",
+        details={
+            "trigger_type": trigger_type,
+            "timebox_minutes": timebox_minutes,
+            "enable_external_research": enable_external_research,
+            "has_local_attempt_summary": bool(local_attempt_summary),
+        },
+    )
+    try:
+        plan = generate_kickoff_plan(
+            user_input=query_text,
+            llm=llm,
+            trigger_type=trigger_type,
+            enable_external_research=enable_external_research,
+            timebox_minutes=timebox_minutes,
+        )
+    except Exception:
+        plan = default_research_plan(query_text, trigger_type=trigger_type)
+
+    _save_research_artifacts(
+        batch,
+        plan,
+        trigger_type=trigger_type,
+        timebox_minutes=timebox_minutes,
+        enable_external_research=enable_external_research,
+        problem_statement=query_text,
+        local_attempt_summary=local_attempt_summary,
+    )
+    _append_stage_event(
+        batch,
+        stage="research",
+        event="planning_done",
+        details={"recommended_option": plan.recommended_option, "sources": len(plan.sources)},
+    )
+    return plan
+
+
 def create_batch(
     pm_root: str | Path,
     project_name: str,
@@ -271,7 +554,13 @@ def create_batch(
     return batch
 
 
-def run_spec_generation(batch: BatchState, llm: LLM) -> BatchState:
+def run_spec_generation(
+    batch: BatchState,
+    llm: LLM,
+    *,
+    user_input_override: str | None = None,
+    stage_name: str | None = None,
+) -> BatchState:
     """Run requirement + architecture workflows, save openspec docs."""
     print("[PM] Running spec generation (requirement → architecture)")
     batch.status = "in_progress"
@@ -279,11 +568,12 @@ def run_spec_generation(batch: BatchState, llm: LLM) -> BatchState:
 
     openspec_dir = batch.batch_dir / "openspec"
     openspec_dir.mkdir(exist_ok=True)
+    user_input_text = user_input_override or (batch.batch_dir / "requirements.md").read_text(encoding="utf-8")
 
     # Requirement workflow
     req_state = run_requirement_workflow(
         llm=llm,
-        user_input=(batch.batch_dir / "requirements.md").read_text(encoding="utf-8"),
+        user_input=user_input_text,
         project_name=batch.project_name,
     )
     if req_state.error or req_state.current_step != "done":
@@ -313,6 +603,15 @@ def run_spec_generation(batch: BatchState, llm: LLM) -> BatchState:
     if arch_state.spec_markdown:
         (openspec_dir / "spec.md").write_text(arch_state.spec_markdown, encoding="utf-8")
         print(f"  Saved spec.md")
+
+    # Keep stage snapshots for phased execution replay.
+    if stage_name:
+        stage_dir = batch.batch_dir / "openspec_stages" / stage_name
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        for name in ["proposal.md", "design.md", "tasks.md", "spec.md"]:
+            src = openspec_dir / name
+            if src.exists():
+                (stage_dir / name).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
     _save_progress(batch)
     return batch
@@ -563,6 +862,327 @@ def run_batch(
     completed = sum(1 for t in batch.tasks if t.status == "completed")
     print(f"[PM] Batch finished: {batch.status} (TDD {'passed' if result.success else 'failed'}, "
           f"{len(batch.tasks)} tasks tracked)")
+    return batch
+
+
+def _write_mid_report_placeholder(
+    batch: BatchState,
+    *,
+    auto_continue_sota: bool,
+    mvp_summary: str,
+) -> None:
+    """Persist MVP mid-report hook payload (placeholder until channel is integrated)."""
+    payload = {
+        "run_id": batch.batch_id,
+        "checkpoint": "mvp_uploaded",
+        "summary": mvp_summary,
+        "decision_required": "continue_to_sota|stop_after_mvp",
+        "default_decision_when_unavailable": (
+            "continue_to_sota" if auto_continue_sota else "stop_after_mvp"
+        ),
+        "created_at": _now_iso(),
+    }
+    _write_json(batch.batch_dir / "mid_report_hook.json", payload)
+
+
+def run_batch_phased(
+    pm_root: str | Path,
+    project_name: str,
+    user_input: str,
+    llm: LLM | None = None,
+    project_type: str = "python",
+    *,
+    auto_continue_sota: bool = True,
+    enable_research_agent: bool = True,
+    research_timebox_minutes: int = 8,
+) -> BatchState:
+    """Phased pipeline: research -> MVP -> mvp_uploaded -> SOTA.
+
+    Main goal:
+    - Integrate research agent planning (MVP and SOTA options).
+    - Execute MVP first as verifiable intermediate state.
+    - Emit mid-report placeholder and continue to SOTA by default.
+    """
+    if llm is None:
+        llm = create_llm()
+
+    # Step 1: Create batch
+    batch = create_batch(pm_root, project_name, user_input, project_type=project_type)
+    _append_stage_event(batch, stage="init", event="batch_created")
+    _append_stage_event(
+        batch,
+        stage="requirement",
+        event="requirement_received",
+        details={"project_name": project_name, "input_length": len(user_input)},
+    )
+
+    clarified_requirement = user_input.strip()
+    _write_clarification_artifact(batch, clarified_requirement)
+    _append_stage_event(
+        batch,
+        stage="clarification",
+        event="clarification_completed",
+        details={"artifact": "clarification.md"},
+    )
+
+    # Step 2: Research planning
+    if enable_research_agent:
+        active_plan = run_research_planning(
+            batch,
+            llm,
+            trigger_type="kickoff_mvp_sota",
+            timebox_minutes=research_timebox_minutes,
+            enable_external_research=True,
+            problem_statement=clarified_requirement,
+        )
+    else:
+        active_plan = default_research_plan(clarified_requirement, trigger_type="kickoff_mvp_sota")
+        _save_research_artifacts(
+            batch,
+            active_plan,
+            trigger_type="kickoff_mvp_sota",
+            timebox_minutes=research_timebox_minutes,
+            enable_external_research=False,
+            problem_statement=clarified_requirement,
+        )
+    _append_stage_event(
+        batch,
+        stage="research",
+        event="research_completed",
+        details={"trigger": "kickoff_mvp_sota", "recommended_option": active_plan.recommended_option},
+    )
+    _append_stage_event(
+        batch,
+        stage="selection",
+        event="option_selected",
+        details={"recommended_option": active_plan.recommended_option},
+    )
+    _append_stage_event(
+        batch,
+        stage="selection",
+        event="mvp_scope_extracted",
+        details={
+            "mvp_scope_count": len(active_plan.mvp_scope),
+            "mvp_extracted_from_sota": bool(active_plan.mvp_extracted_from_sota),
+        },
+    )
+
+    def _run_stage_once(stage: str, stage_input: str, mode: str) -> tuple[bool, TDDResult | None, str]:
+        nonlocal batch
+        _append_stage_event(batch, stage=stage, event="spec_generation_start")
+        batch = run_spec_generation(batch, llm, user_input_override=stage_input, stage_name=stage)
+        if batch.status == "failed":
+            err = batch.error or f"{stage} spec_generation_failed"
+            _append_quality_gate(
+                batch,
+                stage=stage,
+                gate="spec_generation",
+                passed=False,
+                details={"error": err},
+            )
+            _append_stage_event(batch, stage=stage, event="spec_generation_failed", details={"error": err})
+            return False, None, err
+
+        prepare_tasks(batch)
+        _append_stage_event(batch, stage=stage, event="tdd_start")
+        result = run_batch_tdd(batch, llm, mode=mode)
+        _append_quality_gate(
+            batch,
+            stage=stage,
+            gate="tdd",
+            passed=bool(result.success),
+            details={
+                "mode": mode,
+                "summary": result.summary,
+                "whitebox_passed": result.whitebox_passed,
+                "blackbox_passed": result.blackbox_passed,
+                "retry_count": result.retry_count,
+            },
+        )
+        _append_stage_event(
+            batch,
+            stage=stage,
+            event="tdd_done",
+            details={"success": result.success, "summary": result.summary},
+        )
+        if result.success:
+            return True, result, ""
+        return False, result, result.summary or f"{stage} tdd_failed"
+
+    # Step 3: MVP stage
+    mvp_deadlock_recovered = False
+    mvp_input = _build_stage_requirement(clarified_requirement, active_plan, "mvp")
+    mvp_ok, mvp_result, mvp_err = _run_stage_once("mvp", mvp_input, "create")
+    if not mvp_ok and enable_research_agent:
+        _append_stage_event(
+            batch,
+            stage="mvp",
+            event="deadlock_resolution_start",
+            details={"last_error": mvp_err},
+        )
+        active_plan = run_research_planning(
+            batch,
+            llm,
+            trigger_type="deadlock_resolution",
+            timebox_minutes=research_timebox_minutes,
+            enable_external_research=True,
+            problem_statement=mvp_input,
+            local_attempt_summary=f"stage=mvp; mode=create; error={mvp_err}",
+        )
+        _append_stage_event(
+            batch,
+            stage="mvp",
+            event="deadlock_resolution_done",
+            details={"sources": len(active_plan.sources)},
+        )
+        mvp_deadlock_recovered = True
+        mvp_input = _build_stage_requirement(clarified_requirement, active_plan, "mvp")
+        mvp_ok, mvp_result, mvp_err = _run_stage_once("mvp", mvp_input, "create")
+
+    if not mvp_ok or mvp_result is None:
+        _write_stage_checkpoint(batch, current_stage="mvp", gate_passed=False)
+        batch.status = "failed"
+        batch.error = mvp_err
+        _save_progress(batch)
+        _write_exit_conditions(
+            batch,
+            current_stage="mvp",
+            passed=False,
+            reasons=[mvp_err],
+            required_artifacts=["stage_checkpoint.json", "quality_gates.json"],
+        )
+        return batch
+
+    # MVP intermediate checkpoint + mid-report placeholder
+    _append_stage_event(
+        batch,
+        stage="mvp",
+        event="mvp_implementation_completed",
+        details={"summary": mvp_result.summary},
+    )
+    mvp_artifacts = ["openspec/proposal.md", "openspec/design.md", "openspec/tasks.md", "openspec/spec.md"]
+    _write_stage_checkpoint(batch, current_stage="mvp_uploaded", gate_passed=True, artifact_refs=mvp_artifacts)
+    _write_mid_report_placeholder(
+        batch,
+        auto_continue_sota=auto_continue_sota,
+        mvp_summary=mvp_result.summary,
+    )
+    _append_stage_event(
+        batch,
+        stage="mvp_uploaded",
+        event="checkpoint_written",
+        details={"auto_continue_sota": auto_continue_sota},
+    )
+
+    if not auto_continue_sota:
+        batch.status = "completed"
+        _save_progress(batch)
+        _write_stage_checkpoint(batch, current_stage="done", gate_passed=True, artifact_refs=mvp_artifacts)
+        _write_exit_conditions(
+            batch,
+            current_stage="done",
+            passed=True,
+            reasons=["mvp_completed_stop_after_mvp"],
+            required_artifacts=[
+                "mid_report_hook.json",
+                "stage_checkpoint.json",
+                "quality_gates.json",
+                *mvp_artifacts,
+            ],
+        )
+        return batch
+
+    # Step 4: SOTA stage (default auto-continue)
+    sota_deadlock_recovered = False
+    sota_input = _build_stage_requirement(clarified_requirement, active_plan, "sota")
+    sota_ok, sota_result, sota_err = _run_stage_once("sota", sota_input, "modify")
+    if not sota_ok and enable_research_agent:
+        _append_stage_event(
+            batch,
+            stage="sota",
+            event="deadlock_resolution_start",
+            details={"last_error": sota_err},
+        )
+        active_plan = run_research_planning(
+            batch,
+            llm,
+            trigger_type="deadlock_resolution",
+            timebox_minutes=research_timebox_minutes,
+            enable_external_research=True,
+            problem_statement=sota_input,
+            local_attempt_summary=f"stage=sota; mode=modify; error={sota_err}",
+        )
+        _append_stage_event(
+            batch,
+            stage="sota",
+            event="deadlock_resolution_done",
+            details={"sources": len(active_plan.sources)},
+        )
+        sota_deadlock_recovered = True
+        sota_input = _build_stage_requirement(clarified_requirement, active_plan, "sota")
+        sota_ok, sota_result, sota_err = _run_stage_once("sota", sota_input, "modify")
+
+    if sota_result is None:
+        batch.status = "failed"
+        batch.error = sota_err
+        _write_stage_checkpoint(batch, current_stage="sota", gate_passed=False)
+        _save_progress(batch)
+        _write_exit_conditions(
+            batch,
+            current_stage="sota",
+            passed=False,
+            reasons=[sota_err],
+            required_artifacts=["mid_report_hook.json", "stage_checkpoint.json", "quality_gates.json"],
+        )
+        return batch
+
+    if sota_ok and sota_result.success:
+        batch.status = "completed"
+        _append_stage_event(
+            batch,
+            stage="sota",
+            event="sota_implementation_completed",
+            details={"summary": sota_result.summary},
+        )
+        _write_stage_checkpoint(batch, current_stage="done", gate_passed=True)
+    else:
+        batch.status = "failed"
+        batch.error = sota_err
+        _write_stage_checkpoint(batch, current_stage="sota", gate_passed=False)
+    _save_progress(batch)
+
+    _write_json(batch.batch_dir / "phase_results.json", {
+        "mvp": {
+            "success": mvp_result.success,
+            "summary": mvp_result.summary,
+            "whitebox_passed": mvp_result.whitebox_passed,
+            "blackbox_passed": mvp_result.blackbox_passed,
+        },
+        "sota": {
+            "success": sota_result.success,
+            "summary": sota_result.summary,
+            "whitebox_passed": sota_result.whitebox_passed,
+            "blackbox_passed": sota_result.blackbox_passed,
+        },
+        "deadlock_recovery": {
+            "mvp": mvp_deadlock_recovered,
+            "sota": sota_deadlock_recovered,
+        },
+        "auto_continue_sota": auto_continue_sota,
+    })
+    _write_exit_conditions(
+        batch,
+        current_stage="done" if batch.status == "completed" else "sota",
+        passed=batch.status == "completed",
+        reasons=[] if batch.status == "completed" else [batch.error or "sota_failed"],
+        required_artifacts=[
+            "mid_report_hook.json",
+            "stage_checkpoint.json",
+            "quality_gates.json",
+            "phase_results.json",
+            *mvp_artifacts,
+        ],
+    )
     return batch
 
 

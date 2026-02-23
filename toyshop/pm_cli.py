@@ -3,6 +3,7 @@
 Usage:
   # Full auto pipeline (existing)
   python3 -m toyshop.pm_cli run --name <project> --input <file_or_text> [--pm-root <dir>]
+  python3 -m toyshop.pm_cli run-phased --name <project> --input <file_or_text> [--pm-root <dir>]
 
   # Step-by-step greenfield
   python3 -m toyshop.pm_cli create --name <project> --input <file_or_text> [--pm-root <dir>]
@@ -19,6 +20,7 @@ Usage:
   # Utilities
   python3 -m toyshop.pm_cli status --batch <batch_dir>
   python3 -m toyshop.pm_cli resume --batch <batch_dir>
+  python3 -m toyshop.pm_cli research-deadlock --batch <batch_dir> [--summary <text>] [--problem <file_or_text>]
 """
 
 from __future__ import annotations
@@ -38,6 +40,26 @@ def cmd_run(args: argparse.Namespace) -> None:
     llm = create_llm()
     batch = run_batch(Path(args.pm_root), args.name, user_input, llm,
                       project_type=args.project_type)
+    _print_result(batch)
+
+
+def cmd_run_phased(args: argparse.Namespace) -> None:
+    """Phased auto: research -> MVP -> mvp_uploaded -> SOTA."""
+    from toyshop.pm import run_batch_phased
+    from toyshop.llm import create_llm
+
+    user_input = _read_input(args.input)
+    llm = create_llm()
+    batch = run_batch_phased(
+        Path(args.pm_root),
+        args.name,
+        user_input,
+        llm,
+        project_type=args.project_type,
+        auto_continue_sota=not args.stop_after_mvp,
+        enable_research_agent=not args.skip_research,
+        research_timebox_minutes=args.research_timebox,
+    )
     _print_result(batch)
 
 
@@ -141,6 +163,13 @@ def cmd_status(args: argparse.Namespace) -> None:
         elif "success" in result:
             print(f"\nTDD: {'PASS' if result['success'] else 'FAIL'}")
 
+    stage_checkpoint_path = batch_dir / "stage_checkpoint.json"
+    if stage_checkpoint_path.exists():
+        ck = json.loads(stage_checkpoint_path.read_text(encoding="utf-8"))
+        print("\nStage checkpoint:")
+        print(f"  current_stage: {ck.get('current_stage')}")
+        print(f"  gate_passed: {ck.get('stage_gate_passed')}")
+
 
 def cmd_resume(args: argparse.Namespace) -> None:
     """Resume an interrupted batch (re-run TDD)."""
@@ -150,6 +179,32 @@ def cmd_resume(args: argparse.Namespace) -> None:
     llm = create_llm()
     batch = resume_batch(args.batch, llm)
     _print_result(batch)
+
+
+def cmd_research_deadlock(args: argparse.Namespace) -> None:
+    """Manual trigger for deadlock-resolution research planning."""
+    from toyshop.pm import load_batch, run_research_planning
+    from toyshop.llm import create_llm
+
+    batch = load_batch(args.batch)
+    llm = create_llm()
+    problem_statement = _read_input(args.problem) if args.problem else None
+    plan = run_research_planning(
+        batch,
+        llm,
+        trigger_type="deadlock_resolution",
+        timebox_minutes=args.research_timebox,
+        enable_external_research=not args.skip_external_research,
+        problem_statement=problem_statement,
+        local_attempt_summary=args.summary,
+    )
+
+    print("Deadlock research plan generated.")
+    print(f"  trigger_type: {plan.trigger_type}")
+    print(f"  recommended_option: {plan.recommended_option}")
+    print(f"  mvp_scope_count: {len(plan.mvp_scope)}")
+    print(f"  sources_count: {len(plan.sources)}")
+    print(f"Artifacts: {Path(args.batch) / 'research'}")
 
 
 def cmd_change_create(args: argparse.Namespace) -> None:
@@ -374,6 +429,37 @@ def main() -> None:
     p_run.add_argument("--type", dest="project_type", default="python",
                         help="Project type: python, java, java-minecraft, json-minecraft")
 
+    # run-phased (research + staged MVP/SOTA)
+    p_run_phased = sub.add_parser(
+        "run-phased",
+        help="Phased auto: research → MVP → mvp_uploaded → SOTA",
+    )
+    p_run_phased.add_argument("--name", required=True)
+    p_run_phased.add_argument("--input", required=True, help="Requirements text or path to .md file")
+    p_run_phased.add_argument("--pm-root", default=str(Path.home() / ".toyshop" / "projects"))
+    p_run_phased.add_argument(
+        "--type",
+        dest="project_type",
+        default="python",
+        help="Project type: python, java, java-minecraft, json-minecraft",
+    )
+    p_run_phased.add_argument(
+        "--stop-after-mvp",
+        action="store_true",
+        help="Stop after MVP checkpoint (do not auto-continue to SOTA)",
+    )
+    p_run_phased.add_argument(
+        "--skip-research",
+        action="store_true",
+        help="Skip research agent and use deterministic fallback MVP/SOTA plan",
+    )
+    p_run_phased.add_argument(
+        "--research-timebox",
+        type=int,
+        default=8,
+        help="Research timebox in minutes for kickoff planning",
+    )
+
     # create (step 1)
     p_create = sub.add_parser("create", help="Step 1: Create batch with requirements")
     p_create.add_argument("--name", required=True)
@@ -401,6 +487,34 @@ def main() -> None:
     # resume
     p_resume = sub.add_parser("resume", help="Resume interrupted batch")
     p_resume.add_argument("--batch", required=True)
+
+    # research-deadlock
+    p_rd = sub.add_parser(
+        "research-deadlock",
+        help="Manual trigger: deadlock resolution research for an existing batch",
+    )
+    p_rd.add_argument("--batch", required=True)
+    p_rd.add_argument(
+        "--summary",
+        default="",
+        help="Local attempt summary (why we are stuck)",
+    )
+    p_rd.add_argument(
+        "--problem",
+        default=None,
+        help="Problem statement text or path; default uses requirements.md",
+    )
+    p_rd.add_argument(
+        "--research-timebox",
+        type=int,
+        default=8,
+        help="Research timebox in minutes",
+    )
+    p_rd.add_argument(
+        "--skip-external-research",
+        action="store_true",
+        help="Disable external GPT Researcher and keep deterministic local planning",
+    )
 
     # change-create
     p_cc = sub.add_parser("change-create", help="Change step 1: Create change batch")
@@ -437,9 +551,11 @@ def main() -> None:
 
     args = parser.parse_args()
     cmd = {
-        "run": cmd_run, "create": cmd_create, "spec": cmd_spec,
+        "run": cmd_run, "run-phased": cmd_run_phased,
+        "create": cmd_create, "spec": cmd_spec,
         "tasks": cmd_tasks, "tdd": cmd_tdd, "status": cmd_status,
         "resume": cmd_resume,
+        "research-deadlock": cmd_research_deadlock,
         "change-create": cmd_change_create,
         "change-analyze": cmd_change_analyze,
         "change-spec": cmd_change_spec,
