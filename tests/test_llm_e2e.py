@@ -9,6 +9,7 @@ WARNING: These tests make real API calls and may take 30-90 seconds each.
 import pytest
 import tempfile
 import shutil
+import os
 from pathlib import Path
 
 from toyshop import create_llm, run_development_pipeline
@@ -25,17 +26,20 @@ pytestmark = [
 @pytest.fixture
 def llm():
     """Create LLM instance from openhands config. Skip if LLM service unavailable."""
+    if os.getenv("TOYSHOP_RUN_LIVE_E2E", "0") != "1":
+        pytest.skip("Set TOYSHOP_RUN_LIVE_E2E=1 to run live E2E tests")
+
     _llm = create_llm()
     # Quick connectivity check — skip entire test if LLM service is down
     import litellm
     try:
-        litellm.completion(
+        litellm.responses(
             model=_llm.model,
-            messages=[{"role": "user", "content": "ping"}],
+            input=[{"role": "user", "content": "ping"}],
             api_key=_llm.api_key.get_secret_value() if _llm.api_key else None,
-            base_url=_llm.base_url,
-            max_tokens=5,
+            api_base=_llm.base_url,
             timeout=15,
+            num_retries=0,
         )
     except Exception as e:
         pytest.skip(f"LLM service unavailable: {e}")
@@ -59,19 +63,23 @@ class TestRealLLM:
         """Test that LLM can connect and respond."""
         import litellm
 
-        response = litellm.completion(
+        response = litellm.responses(
             model=llm.model,
-            messages=[{"role": "user", "content": "Say 'OK' if you can hear me."}],
+            input=[{"role": "user", "content": "Say 'OK' if you can hear me."}],
             api_key=llm.api_key.get_secret_value() if llm.api_key else None,
-            base_url=llm.base_url,
-            max_tokens=100,  # GLM-5 is a reasoning model, needs more tokens
+            api_base=llm.base_url,
             timeout=60,
         )
 
-        assert response.choices
-        # GLM-5 may put content in reasoning_content for short responses
-        msg = response.choices[0].message
-        assert msg.content or getattr(msg, 'reasoning_content', None)
+        assert response.output
+        # Extract text from response output
+        text = ""
+        for item in response.output:
+            if hasattr(item, 'content'):
+                for c in item.content:
+                    if hasattr(c, 'text'):
+                        text += c.text
+        assert len(text) > 0
 
     @pytest.mark.timeout(180)
     def test_requirement_workflow_real(self, llm):

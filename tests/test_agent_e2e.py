@@ -9,6 +9,7 @@ WARNING: These tests make real API calls and may take 60-180 seconds each.
 import pytest
 import tempfile
 import shutil
+import os
 from pathlib import Path
 
 from toyshop import (
@@ -32,15 +33,17 @@ pytestmark = [
 @pytest.fixture
 def llm():
     """Create LLM instance from openhands config. Skip if LLM service unavailable."""
+    if os.getenv("TOYSHOP_RUN_LIVE_E2E", "0") != "1":
+        pytest.skip("Set TOYSHOP_RUN_LIVE_E2E=1 to run live E2E tests")
+
     _llm = create_toyshop_llm()
     # Quick connectivity check — skip entire test if LLM service is down
     try:
         from openhands.sdk.llm.message import Message, TextContent
-        _llm.completion(
+        _llm.responses(
             messages=[
                 Message(role="user", content=[TextContent(text="ping")])
             ],
-            max_tokens=5,
         )
     except Exception as e:
         pytest.skip(f"LLM service unavailable: {e}")
@@ -64,7 +67,7 @@ class TestAgentArchitecture:
         """Test that LLM can connect using openhands-sdk."""
         from openhands.sdk.llm.message import Message, TextContent
 
-        response = llm.completion(
+        response = llm.responses(
             messages=[
                 Message(
                     role="user",
@@ -74,7 +77,6 @@ class TestAgentArchitecture:
         )
 
         assert response is not None
-        # LLMResponse has .message (Message) and .raw_response (ModelResponse)
         assert response.message is not None
         msg_content = ""
         for item in response.message.content:
