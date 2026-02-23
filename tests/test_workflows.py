@@ -67,6 +67,20 @@ class MockResponse:
     choices: list
 
 
+@dataclass
+class MockResponsesOutput:
+    """Mock Responses API function_call output item."""
+    type: str
+    name: str
+    arguments: str
+
+
+@dataclass
+class MockResponsesResponse:
+    """Mock Responses API response object."""
+    output: list
+
+
 def make_mock_response_with_tool(tool_name: str, arguments: str):
     """Create a mock litellm response with a tool call."""
     return MockResponse(
@@ -83,6 +97,19 @@ def make_mock_response_with_tool(tool_name: str, arguments: str):
                         )
                     ],
                 )
+            )
+        ]
+    )
+
+
+def make_mock_responses_with_tool(tool_name: str, arguments: str):
+    """Create a mock litellm.responses response with a function call."""
+    return MockResponsesResponse(
+        output=[
+            MockResponsesOutput(
+                type="function_call",
+                name=tool_name,
+                arguments=arguments,
             )
         ]
     )
@@ -114,12 +141,19 @@ class TestRequirementWorkflow:
         """Test the analyze_input node."""
         from toyshop.workflows.requirement import analyze_input
 
-        response = make_mock_response_with_tool(
+        chat_response = make_mock_response_with_tool(
+            "analyze_input",
+            '{"domain": "e-commerce", "target_users": ["buyers"], "core_features": ["cart"], "constraints": [], "existing_context": []}'
+        )
+        responses_response = make_mock_responses_with_tool(
             "analyze_input",
             '{"domain": "e-commerce", "target_users": ["buyers"], "core_features": ["cart"], "constraints": [], "existing_context": []}'
         )
 
-        with patch("toyshop.llm.litellm.completion", return_value=response):
+        with (
+            patch("toyshop.llm.litellm.completion", return_value=chat_response),
+            patch("toyshop.llm.litellm.responses", return_value=responses_response),
+        ):
             state = RequirementState(
                 user_input="I want to build an online store",
                 project_name="MyStore",
@@ -136,7 +170,22 @@ class TestRequirementWorkflow:
         """Test the generate_proposal_node."""
         from toyshop.workflows.requirement import generate_proposal_node
 
-        response = make_mock_response_with_tool(
+        chat_response = make_mock_response_with_tool(
+            "generate_proposal_data",
+            '''{
+                "project_name": "TestApp",
+                "background": "Need an app",
+                "problem": "No app exists",
+                "goals": ["Build app"],
+                "non_goals": [],
+                "capabilities": [{"name": "Core", "description": "Core feature", "priority": "must"}],
+                "impacted_areas": ["backend"],
+                "risks": [],
+                "dependencies": [],
+                "timeline": "2 weeks"
+            }'''
+        )
+        responses_response = make_mock_responses_with_tool(
             "generate_proposal_data",
             '''{
                 "project_name": "TestApp",
@@ -152,7 +201,10 @@ class TestRequirementWorkflow:
             }'''
         )
 
-        with patch("toyshop.llm.litellm.completion", return_value=response):
+        with (
+            patch("toyshop.llm.litellm.completion", return_value=chat_response),
+            patch("toyshop.llm.litellm.responses", return_value=responses_response),
+        ):
             state = RequirementState(
                 user_input="Build an app",
                 project_name="TestApp",
@@ -196,12 +248,19 @@ class TestArchitectureWorkflow:
         """Test the analyze_proposal_node."""
         from toyshop.workflows.architecture import analyze_proposal_node
 
-        response = make_mock_response_with_tool(
+        chat_response = make_mock_response_with_tool(
+            "analyze_proposal",
+            '{"goals": ["Scalability", "Maintainability"], "decisions": ["Use microservices"], "tradeoffs": ["Complexity vs flexibility"]}'
+        )
+        responses_response = make_mock_responses_with_tool(
             "analyze_proposal",
             '{"goals": ["Scalability", "Maintainability"], "decisions": ["Use microservices"], "tradeoffs": ["Complexity vs flexibility"]}'
         )
 
-        with patch("toyshop.llm.litellm.completion", return_value=response):
+        with (
+            patch("toyshop.llm.litellm.completion", return_value=chat_response),
+            patch("toyshop.llm.litellm.responses", return_value=responses_response),
+        ):
             state = ArchitectureState(proposal=sample_proposal)
             result = analyze_proposal_node(mock_llm, state)
 
@@ -213,7 +272,21 @@ class TestArchitectureWorkflow:
         """Test the design_modules_node."""
         from toyshop.workflows.architecture import design_modules_node, ArchitectureAnalysis
 
-        response = make_mock_response_with_tool(
+        chat_response = make_mock_response_with_tool(
+            "design_modules",
+            '''{
+                "modules": [{
+                    "id": "core",
+                    "name": "Core",
+                    "description": "Core module",
+                    "responsibilities": ["Handle logic"],
+                    "dependencies": [],
+                    "filePath": "src/core/index.ts"
+                }],
+                "dataModels": []
+            }'''
+        )
+        responses_response = make_mock_responses_with_tool(
             "design_modules",
             '''{
                 "modules": [{
@@ -228,7 +301,10 @@ class TestArchitectureWorkflow:
             }'''
         )
 
-        with patch("toyshop.llm.litellm.completion", return_value=response):
+        with (
+            patch("toyshop.llm.litellm.completion", return_value=chat_response),
+            patch("toyshop.llm.litellm.responses", return_value=responses_response),
+        ):
             state = ArchitectureState(
                 proposal=sample_proposal,
                 analysis=ArchitectureAnalysis(goals=["Test"], decisions=["Use modules"], tradeoffs=[]),
@@ -283,7 +359,20 @@ class TestWorkflowIntegration:
             call_count[0] += 1
             return responses[idx]
 
-        with patch("toyshop.llm.litellm.completion", side_effect=mock_response):
+        def mock_responses_api(*args, **kwargs):
+            idx = min(call_count[0], len(responses) - 1)
+            call_count[0] += 1
+            r = responses[idx]
+            tool_call = r.choices[0].message.tool_calls[0]
+            return make_mock_responses_with_tool(
+                tool_call.function.name,
+                tool_call.function.arguments,
+            )
+
+        with (
+            patch("toyshop.llm.litellm.completion", side_effect=mock_response),
+            patch("toyshop.llm.litellm.responses", side_effect=mock_responses_api),
+        ):
             state = run_requirement_workflow(
                 llm=mock_llm,
                 user_input="Build a REST API",
