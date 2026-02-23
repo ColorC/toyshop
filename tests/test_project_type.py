@@ -351,3 +351,258 @@ class TestPromptContext:
         ctx = PromptContext.from_project_type(pt)
         assert ctx.language == "JSON"
         assert ctx.test_framework == "json-schema"
+
+
+# ---------------------------------------------------------------------------
+# LanguageSupport — Java
+# ---------------------------------------------------------------------------
+
+from toyshop.lang.java_lang import JavaLanguageSupport
+
+
+class TestJavaLanguageSupport:
+    """Tests for JavaLanguageSupport."""
+
+    @pytest.fixture
+    def lang(self):
+        return JavaLanguageSupport()
+
+    # -- normalize_signature --
+
+    def test_normalize_already_valid_class(self, lang):
+        assert lang.normalize_signature("Calc", "public class Calc") == "public class Calc"
+
+    def test_normalize_already_valid_method(self, lang):
+        sig = "public int add(int a, int b)"
+        assert lang.normalize_signature("add", sig) == sig
+
+    def test_normalize_interface(self, lang):
+        sig = "public interface Sortable"
+        assert lang.normalize_signature("Sortable", sig) == sig
+
+    def test_normalize_bare_params_with_arrow(self, lang):
+        result = lang.normalize_signature("add", "(int a, int b) -> int")
+        assert result == "public int add(int a, int b)"
+
+    def test_normalize_bare_params_void(self, lang):
+        result = lang.normalize_signature("reset", "()")
+        assert result == "public void reset()"
+
+    def test_normalize_annotation_as_class(self, lang):
+        result = lang.normalize_signature("Config", "@Data")
+        assert result == "public class Config"
+
+    def test_normalize_plain_name_as_class(self, lang):
+        result = lang.normalize_signature("Calculator", "Calculator")
+        assert result == "public class Calculator"
+
+    # -- is_valid_signature --
+
+    def test_valid_java_method(self, lang):
+        assert lang.is_valid_signature("public int add(int a, int b)") is True
+
+    def test_valid_java_class(self, lang):
+        assert lang.is_valid_signature("public class Calculator") is True
+
+    def test_valid_java_void(self, lang):
+        assert lang.is_valid_signature("void reset()") is True
+
+    def test_invalid_python_def(self, lang):
+        assert lang.is_valid_signature("def add(self, a, b)") is False
+
+    def test_invalid_ts_arrow(self, lang):
+        assert lang.is_valid_signature("(a: number) => string") is False
+
+    # -- generate_stub_for_module --
+
+    def test_stub_simple_class(self, lang):
+        ifaces = [
+            {"name": "Calculator", "signature": "public class Calculator"},
+            {"name": "add", "signature": "public int add(int a, int b)"},
+        ]
+        code = lang.generate_stub_for_module(ifaces)
+        assert "public class Calculator {" in code
+        assert "public int add(int a, int b) {" in code
+        assert "UnsupportedOperationException" in code
+
+    def test_stub_interface(self, lang):
+        ifaces = [
+            {"name": "Sortable", "signature": "public interface Sortable"},
+            {"name": "sort", "signature": "public void sort(int[] arr)"},
+        ]
+        code = lang.generate_stub_for_module(ifaces)
+        assert "public interface Sortable {" in code
+        assert "public void sort(int[] arr);" in code
+
+    # -- build_module_map --
+
+    def test_module_map_java(self, lang):
+        modules = [{"name": "Calculator (`Calculator`)", "filePath": "src/main/java/com/example/Calculator.java"}]
+        mapping = lang.build_module_map(modules)
+        assert mapping["Calculator"] == "com.example.Calculator"
+
+    def test_module_map_strips_prefix(self, lang):
+        modules = [{"name": "core", "filePath": "src/main/java/com/app/Core.java"}]
+        mapping = lang.build_module_map(modules)
+        assert mapping["core"] == "com.app.Core"
+
+    # -- module_path_from_file --
+
+    def test_module_path_java(self, lang):
+        assert lang.module_path_from_file("src/main/java/com/example/Calc.java") == "com.example.Calc"
+
+    def test_module_path_no_prefix(self, lang):
+        assert lang.module_path_from_file("com/example/Calc.java") == "com.example.Calc"
+
+    # -- build_smoke_command --
+
+    def test_smoke_command(self, lang):
+        cmd = lang.build_smoke_command(["com.example.Calc"])
+        assert "gradlew" in cmd
+        assert "smoke ok" in cmd
+
+    def test_smoke_command_empty(self, lang):
+        cmd = lang.build_smoke_command([])
+        assert "no stubs" in cmd
+        assert "smoke ok" in cmd
+
+    # -- extract_test_metadata --
+
+    def test_extract_test_metadata(self, lang, tmp_path):
+        workspace = tmp_path / "workspace"
+        test_dir = workspace / "src" / "test" / "java" / "com" / "example"
+        test_dir.mkdir(parents=True)
+
+        (test_dir / "CalcTest.java").write_text(
+            "package com.example;\n"
+            "import org.junit.jupiter.api.Test;\n"
+            "class CalcTest {\n"
+            "    @Test\n"
+            "    void testAdd() { }\n"
+            "    @Test\n"
+            "    void testSub() { }\n"
+            "    void helper() { }\n"
+            "}\n"
+        )
+
+        files, cases = lang.extract_test_metadata(workspace)
+        assert len(files) == 1
+        assert "CalcTest.java" in files[0]
+        assert len(cases) == 2
+        names = {c["name"] for c in cases}
+        assert names == {"testAdd", "testSub"}
+
+    def test_extract_empty_workspace(self, lang, tmp_path):
+        files, cases = lang.extract_test_metadata(tmp_path)
+        assert files == []
+        assert cases == []
+
+    # -- generate_test_skeletons --
+
+    def test_generate_skeletons(self, lang, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        interfaces = [
+            {"name": "Calculator", "signature": "public class Calculator", "module": "calc"},
+            {"name": "add", "signature": "public int add(int a, int b)", "module": "calc"},
+        ]
+        module_map = {"calc": "com.example.Calculator"}
+        generated = lang.generate_test_skeletons(interfaces, module_map, workspace)
+        assert len(generated) == 1
+        assert "CalculatorTest.java" in generated[0]
+        content = Path(workspace / generated[0]).read_text()
+        assert "package com.example;" in content
+        assert "class CalculatorTest" in content
+        assert "@Test" in content
+        assert "testAdd" in content
+
+    # -- to_snake_case (inherited) --
+
+    def test_snake_case(self, lang):
+        assert lang.to_snake_case("Calculator") == "calculator"
+        assert lang.to_snake_case("MemoryManager") == "memory_manager"
+
+
+# ---------------------------------------------------------------------------
+# LanguageSupport — Java Registry
+# ---------------------------------------------------------------------------
+
+
+class TestJavaLanguageRegistry:
+    """Tests for Java language support registry."""
+
+    def test_java_registered(self):
+        lang = get_language_support("java")
+        assert isinstance(lang, JavaLanguageSupport)
+
+
+# ---------------------------------------------------------------------------
+# TestRunner — GradleTestRunner
+# ---------------------------------------------------------------------------
+
+from toyshop.test_runner import GradleTestRunner
+
+
+class TestGradleTestRunner:
+    """Tests for GradleTestRunner output parsing."""
+
+    @pytest.fixture
+    def runner(self):
+        return GradleTestRunner()
+
+    def test_parse_build_successful(self, runner):
+        output = "BUILD SUCCESSFUL in 5s\n3 actionable tasks: 3 executed"
+        result = runner.parse_output(output)
+        assert result.all_passed is True
+
+    def test_parse_build_failed(self, runner):
+        output = "BUILD FAILED in 3s\nExecution failed for task ':test'."
+        result = runner.parse_output(output)
+        assert result.all_passed is False
+
+    def test_parse_test_summary(self, runner):
+        output = "5 tests completed, 2 failed\nBUILD FAILED"
+        result = runner.parse_output(output)
+        assert result.passed == 3
+        assert result.failed == 2
+        assert result.all_passed is False
+
+    def test_parse_all_passed(self, runner):
+        output = "5 tests completed\nBUILD SUCCESSFUL"
+        result = runner.parse_output(output)
+        assert result.passed == 5
+        assert result.failed == 0
+        assert result.all_passed is True
+
+    def test_parse_empty_output(self, runner):
+        result = runner.parse_output("")
+        assert result.all_passed is False
+        assert result.total == 0
+
+    def test_parse_junit_xml(self, runner, tmp_path):
+        """Test JUnit XML report parsing."""
+        report_dir = tmp_path / "build" / "test-results" / "test"
+        report_dir.mkdir(parents=True)
+
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.example.CalcTest" tests="3" failures="1" errors="0">
+  <testcase name="testAdd" classname="com.example.CalcTest" time="0.01"/>
+  <testcase name="testSub" classname="com.example.CalcTest" time="0.01">
+    <failure message="expected 3 but was 5">AssertionError</failure>
+  </testcase>
+  <testcase name="testMul" classname="com.example.CalcTest" time="0.01"/>
+</testsuite>"""
+        (report_dir / "TEST-com.example.CalcTest.xml").write_text(xml_content)
+
+        result = runner._parse_junit_xml(tmp_path)
+        assert result is not None
+        assert result.passed == 2
+        assert result.failed == 1
+        assert result.errors == 0
+        assert result.total == 3
+        assert result.all_passed is False
+        assert len(result.per_test) == 3
+
+    def test_parse_junit_xml_no_reports(self, runner, tmp_path):
+        result = runner._parse_junit_xml(tmp_path)
+        assert result is None

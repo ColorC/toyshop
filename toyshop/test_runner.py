@@ -215,11 +215,178 @@ class PytestRunner(TestRunner):
 
 
 # ---------------------------------------------------------------------------
+# Gradle / JUnit implementation
+# ---------------------------------------------------------------------------
+
+
+class GradleTestRunner(TestRunner):
+    """Gradle + JUnit 5 test runner — parses JUnit XML reports."""
+
+    def run_tests(
+        self,
+        workspace: Path,
+        test_dirs: list[str] | None = None,
+        ignore_patterns: list[str] | None = None,
+        timeout: int = 600,
+    ) -> TestRunResult:
+        """Run ./gradlew test and parse JUnit XML reports."""
+        cmd = ["./gradlew", "test", "--no-daemon"]
+        try:
+            result = subprocess.run(
+                cmd, cwd=workspace, capture_output=True, text=True, timeout=timeout,
+            )
+            combined = result.stdout + "\n" + result.stderr
+        except subprocess.TimeoutExpired:
+            combined = f"gradlew test timed out after {timeout}s"
+        except Exception as e:
+            combined = f"gradlew execution error: {e}"
+
+        # Try JUnit XML first, fall back to console output parsing
+        xml_result = self._parse_junit_xml(workspace)
+        if xml_result and xml_result.total > 0:
+            xml_result.output = combined
+            return xml_result
+
+        parsed = self.parse_output(combined)
+        return parsed
+
+    def run_single_test(
+        self,
+        workspace: Path,
+        test_id: str,
+        timeout: int = 300,
+    ) -> TestRunResult:
+        """Run a single test by fully-qualified name (e.g. com.example.CalcTest#testAdd)."""
+        cmd = ["./gradlew", "test", "--no-daemon", "--tests", test_id]
+        try:
+            result = subprocess.run(
+                cmd, cwd=workspace, capture_output=True, text=True, timeout=timeout,
+            )
+            combined = result.stdout + "\n" + result.stderr
+        except subprocess.TimeoutExpired:
+            combined = f"gradlew test timed out after {timeout}s"
+        except Exception as e:
+            combined = f"gradlew execution error: {e}"
+
+        xml_result = self._parse_junit_xml(workspace)
+        if xml_result and xml_result.total > 0:
+            xml_result.output = combined
+            return xml_result
+
+        parsed = self.parse_output(combined)
+        return parsed
+
+    def parse_output(self, output: str) -> TestRunResult:
+        """Parse Gradle test console output as fallback."""
+        passed = 0
+        failed = 0
+        errors = 0
+
+        # Gradle summary: "3 tests completed, 1 failed"
+        m = re.search(r"(\d+)\s+tests?\s+completed", output)
+        if m:
+            total_completed = int(m.group(1))
+        else:
+            total_completed = 0
+
+        fm = re.search(r"(\d+)\s+failed", output)
+        if fm:
+            failed = int(fm.group(1))
+
+        em = re.search(r"(\d+)\s+errors?", output)
+        if em:
+            errors = int(em.group(1))
+
+        passed = max(0, total_completed - failed - errors)
+        total = passed + failed + errors
+        all_passed = total > 0 and failed == 0 and errors == 0
+
+        # Also check for BUILD SUCCESSFUL / BUILD FAILED
+        if total == 0:
+            if "BUILD SUCCESSFUL" in output:
+                all_passed = True
+                passed = 1
+                total = 1
+            elif "BUILD FAILED" in output:
+                all_passed = False
+                failed = 1
+                total = 1
+
+        return TestRunResult(
+            all_passed=all_passed,
+            total=total,
+            passed=passed,
+            failed=failed,
+            errors=errors,
+            output=output,
+        )
+
+    def _parse_junit_xml(self, workspace: Path) -> TestRunResult | None:
+        """Parse JUnit XML reports from build/test-results/test/."""
+        import xml.etree.ElementTree as ET
+
+        report_dir = workspace / "build" / "test-results" / "test"
+        if not report_dir.exists():
+            return None
+
+        total_passed = 0
+        total_failed = 0
+        total_errors = 0
+        per_test: list[PerTestResult] = []
+
+        for xml_file in sorted(report_dir.glob("TEST-*.xml")):
+            try:
+                tree = ET.parse(xml_file)
+                root = tree.getroot()
+            except (ET.ParseError, OSError):
+                continue
+
+            for testsuite in ([root] if root.tag == "testsuite" else root.findall("testsuite")):
+                for testcase in testsuite.findall("testcase"):
+                    name = testcase.get("name", "")
+                    classname = testcase.get("classname", "")
+                    test_id = f"{classname}#{name}" if classname else name
+
+                    failure = testcase.find("failure")
+                    error = testcase.find("error")
+                    skipped = testcase.find("skipped")
+
+                    if failure is not None:
+                        total_failed += 1
+                        msg = (failure.get("message", "") or failure.text or "")[:2000]
+                        per_test.append(PerTestResult(test_id=test_id, status="failed", failure_message=msg))
+                    elif error is not None:
+                        total_errors += 1
+                        msg = (error.get("message", "") or error.text or "")[:2000]
+                        per_test.append(PerTestResult(test_id=test_id, status="error", failure_message=msg))
+                    elif skipped is not None:
+                        per_test.append(PerTestResult(test_id=test_id, status="skipped"))
+                    else:
+                        total_passed += 1
+                        per_test.append(PerTestResult(test_id=test_id, status="passed"))
+
+        total = total_passed + total_failed + total_errors
+        if total == 0:
+            return None
+
+        return TestRunResult(
+            all_passed=total > 0 and total_failed == 0 and total_errors == 0,
+            total=total,
+            passed=total_passed,
+            failed=total_failed,
+            errors=total_errors,
+            output="",
+            per_test=per_test,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
 _RUNNER_REGISTRY: dict[str, type[TestRunner]] = {
     "pytest": PytestRunner,
+    "junit": GradleTestRunner,
 }
 
 
