@@ -1,6 +1,7 @@
 """Shared fixtures and hooks for toyshop tests."""
 
 import pytest
+from _pytest.runner import pytest_runtest_makereport as _orig_makereport
 
 
 # LLM service error patterns — convert these to skip instead of fail
@@ -10,25 +11,28 @@ _LLM_ERROR_PATTERNS = [
     "APIConnectionError",
     "AuthenticationError",
     "RateLimitError",
-    "Timeout",
     "BadGatewayError",
+    "Upstream request failed",
     "Connection refused",
-    "503",
-    "502",
+    "Timeout Error",
 ]
 
 
-@pytest.hookimpl(tryfirst=True)
+@pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     """Convert LLM service errors in E2E tests to skip instead of fail."""
-    if call.when == "call" and call.excinfo is not None:
-        # Only apply to e2e/slow marked tests or files with _e2e in name
+    outcome = yield
+    report = outcome.get_result()
+
+    if report.when == "call" and report.failed:
         is_e2e = (
             "e2e" in str(item.fspath)
             or any(m.name in ("e2e", "slow") for m in item.iter_markers())
         )
         if is_e2e:
-            error_str = str(call.excinfo.value)
+            error_str = str(report.longreprtext) if hasattr(report, "longreprtext") else str(call.excinfo.value) if call.excinfo else ""
             for pattern in _LLM_ERROR_PATTERNS:
                 if pattern in error_str:
-                    pytest.skip(f"LLM service unavailable: {error_str[:200]}")
+                    report.outcome = "skipped"
+                    report.wasxfail = f"LLM service unavailable: {pattern}"
+                    break
