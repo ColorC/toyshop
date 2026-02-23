@@ -7,6 +7,7 @@ Uses openhands-sdk's LLM for config/auth and litellm for the actual calls.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,12 @@ _CONFIG_SEARCH_PATHS = [
     Path("/home/dministrator/work/openhands/config.toml"),
 ]
 
-# ccman local proxy — same endpoint Claude Code uses
+# Claude Code proxy — reads from ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN env vars
+_CLAUDE_CODE_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "")
+_CLAUDE_CODE_AUTH_TOKEN = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+_CLAUDE_CODE_DEFAULT_MODEL = "anthropic/claude-sonnet-4-20250514"
+
+# Legacy ccman local proxy (deprecated — use Claude Code env vars instead)
 _CCMAN_BASE_URL = "http://127.0.0.1:15721"
 _CCMAN_DEFAULT_MODEL = "anthropic/claude-sonnet-4-20250514"
 
@@ -79,16 +85,27 @@ def create_llm(
     """
     cfg = _read_config_toml()
 
-    # If no explicit base_url, prefer ccman proxy (same as Claude Code)
-    if not base_url and not model and _ccman_available():
+    # 1. Explicit args take precedence
+    if base_url or model:
+        resolved_model = model or cfg.get("model", "openai/gpt-5.3-codex")
+        resolved_base_url = base_url or cfg.get("base_url")
+        resolved_key = api_key or cfg.get("api_key", "")
+    # 2. ccman proxy (same endpoint as Claude Code)
+    elif _ccman_available():
         resolved_model = _CCMAN_DEFAULT_MODEL
         resolved_base_url = _CCMAN_BASE_URL
         resolved_key = "proxy-managed"
         logger.info("Using ccman proxy at %s", _CCMAN_BASE_URL)
-    else:
-        resolved_model = model or cfg.get("model", "openai/gpt-5.3-codex")
-        resolved_base_url = base_url or cfg.get("base_url")
+    # 3. config.toml fallback
+    elif cfg:
+        resolved_model = cfg.get("model", "openai/gpt-5.3-codex")
+        resolved_base_url = cfg.get("base_url")
         resolved_key = api_key or cfg.get("api_key", "")
+    # 4. Bare fallback
+    else:
+        resolved_model = "openai/gpt-5.3-codex"
+        resolved_base_url = None
+        resolved_key = ""
 
     llm = LLM(
         model=resolved_model,
@@ -198,6 +215,8 @@ def chat_with_tool(
 
     Returns parsed tool arguments dict, or None if no tool call was made.
     """
+    # Claude Code proxy and direct Anthropic endpoints use Messages API.
+    # Only use Responses API for non-Anthropic providers (aistock gateway, etc.)
     if llm.model.startswith("anthropic/"):
         return _chat_with_tool_messages(
             llm, system_prompt, user_content,
@@ -260,14 +279,21 @@ def _chat_with_tool_responses(
     tool_description: str,
     tool_parameters: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Tool-calling via OpenAI Responses API (for aistock gateway)."""
+    """Tool-calling via OpenAI Responses API (for aistock gateway / ccman proxy)."""
     tool = _make_responses_tool(tool_name, tool_description, tool_parameters)
 
     # Embed system prompt in user content since gateway overrides instructions
     combined_input = f"{system_prompt}\n\n{user_content}"
 
+    # ccman proxy only speaks Responses API — never route to Messages API.
+    # Also strip "anthropic/" prefix so litellm doesn't internally convert
+    # Responses API calls back to Anthropic Messages API.
+    model = llm.model
+    if llm.base_url == _CCMAN_BASE_URL and model.startswith("anthropic/"):
+        model = model.removeprefix("anthropic/")
+
     response = litellm.responses(
-        model=llm.model,
+        model=model,
         input=[{"role": "user", "content": combined_input}],
         tools=[tool],
         tool_choice="required",
@@ -282,6 +308,43 @@ def _chat_with_tool_responses(
             if item.name == tool_name:
                 return _parse_arguments(item.arguments)
     return None
+
+
+def probe_llm(llm: LLM, timeout: int = 15) -> tuple[bool, str]:
+    """Fast LLM availability check — auto-selects protocol like chat_with_tool.
+
+    Returns (ok, error_message).
+    """
+    if llm.model.startswith("anthropic/"):
+        import anthropic as _anthropic
+        try:
+            client = _anthropic.Anthropic(
+                api_key=llm.api_key.get_secret_value() if llm.api_key else "proxy-managed",
+                base_url=llm.base_url,
+                timeout=timeout,
+            )
+            client.messages.create(
+                model=llm.model.removeprefix("anthropic/"),
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=8,
+            )
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+    else:
+        try:
+            litellm.responses(
+                model=llm.model,
+                input=[{"role": "user", "content": "ping"}],
+                api_key=llm.api_key.get_secret_value() if llm.api_key else None,
+                api_base=llm.base_url,
+                timeout=timeout,
+                num_retries=0,
+                max_output_tokens=8,
+            )
+            return True, ""
+        except Exception as e:
+            return False, str(e)
 
 
 def _parse_arguments(raw: str) -> dict[str, Any] | None:
