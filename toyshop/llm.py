@@ -67,40 +67,27 @@ def create_llm(
         usage_id="toyshop",
         drop_params=True,
         native_tool_calling=True,
-        num_retries=2,
-        retry_min_wait=2,
-        retry_max_wait=10,
+        num_retries=5,
+        retry_min_wait=3,
+        retry_max_wait=30,
         # Gateway proxies don't support these OpenAI-specific params
         reasoning_effort=None,
         prompt_cache_retention=None,
     )
-    # Patch: gateway Responses API rejects temperature param;
-    # SDK hardcodes temperature=1.0 in select_responses_options when not subscription.
-    # Remove it after the fact so litellm's drop_params can handle it.
-    _patch_responses_options_no_temperature()
+    # Force Chat Completions API — aistock.tech gateway returns 502 on /v1/responses
+    _force_chat_completions(llm)
     return llm
 
 
-def _patch_responses_options_no_temperature() -> None:
-    """One-time patch: strip forced temperature from Responses API kwargs.
+def _force_chat_completions(llm: LLM) -> None:
+    """Override uses_responses_api to always return False.
 
-    Must patch both the source module AND the llm module's imported reference.
+    The aistock.tech gateway only supports Chat Completions (/v1/chat/completions),
+    not the Responses API (/v1/responses). Without this, openhands-sdk detects
+    gpt-5.3-codex as supporting Responses API and sends requests to the wrong endpoint.
     """
-    from openhands.sdk.llm.options import responses_options as _src_mod
-    from openhands.sdk.llm import llm as _llm_mod
-
-    if getattr(_src_mod, '_toyshop_patched', False):
-        return
-    _orig = _src_mod.select_responses_options
-
-    def _patched(llm_inst, user_kwargs, *, include, store):
-        out = _orig(llm_inst, user_kwargs, include=include, store=store)
-        out.pop("temperature", None)
-        return out
-
-    _src_mod.select_responses_options = _patched
-    _llm_mod.select_responses_options = _patched
-    _src_mod._toyshop_patched = True
+    # Bypass pydantic's __setattr__ which rejects non-field attributes
+    object.__setattr__(llm, 'uses_responses_api', lambda: False)
 
 
 # ---------------------------------------------------------------------------

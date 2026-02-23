@@ -73,10 +73,14 @@ class TestAgentArchitecture:
             ]
         )
 
-        assert response.response is not None
-        assert response.response.choices
-        msg = response.response.choices[0].message
-        assert msg.content or getattr(msg, 'reasoning_content', None)
+        assert response is not None
+        # LLMResponse has .message (Message) and .raw_response (ModelResponse)
+        assert response.message is not None
+        msg_content = ""
+        for item in response.message.content:
+            if hasattr(item, "text"):
+                msg_content += item.text
+        assert len(msg_content) > 0
 
     @pytest.mark.timeout(180)
     def test_agent_creation(self, llm):
