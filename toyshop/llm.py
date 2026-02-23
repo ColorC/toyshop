@@ -76,6 +76,8 @@ def create_llm(
     )
     # Force Chat Completions API — aistock.tech gateway returns 502 on /v1/responses
     _force_chat_completions(llm)
+    # Flatten role:tool messages — gateway returns 502 on tool_calls/role:tool
+    _patch_message_flattening(llm)
     return llm
 
 
@@ -88,6 +90,145 @@ def _force_chat_completions(llm: LLM) -> None:
     """
     # Bypass pydantic's __setattr__ which rejects non-field attributes
     object.__setattr__(llm, 'uses_responses_api', lambda: False)
+
+
+def _content_to_str(content: Any) -> str:
+    """Extract plain text from content (str, list of dicts, or None)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(item.get("text", ""))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _compress_tool_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compress multi-turn tool-calling history for gateways that don't support it.
+
+    The aistock.tech gateway returns 502 when messages contain `role: tool`
+    or `tool_calls` in assistant messages. Instead of flattening (which confuses
+    the LLM's tool-calling behavior), we compress the history:
+
+    - Extract the system prompt and first user message
+    - Collect all completed tool calls into a summary
+    - Inject the summary into the system prompt
+    - Return a fresh [system, user] message pair
+
+    This preserves the LLM's ability to make new tool calls while avoiding
+    the unsupported message formats.
+    """
+    if not any(m.get("role") == "tool" for m in messages):
+        return messages
+
+    # Extract components
+    system_prompt = ""
+    user_message = ""
+    tool_history: list[tuple[str, str, str]] = []  # (name, args, result)
+    last_assistant_text = ""
+
+    for msg in messages:
+        role = msg.get("role")
+        content = _content_to_str(msg.get("content"))
+
+        if role == "system":
+            system_prompt = content
+        elif role == "user" and not user_message:
+            # Capture the first (original) user message
+            user_message = content
+        elif role == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                if "function" in tc:
+                    tool_history.append((
+                        tc["function"]["name"],
+                        tc["function"].get("arguments", "{}"),
+                        "",  # result filled by next tool message
+                    ))
+            last_assistant_text = content
+        elif role == "tool":
+            tool_name = msg.get("name", "unknown")
+            tool_result = content
+            # Update the last tool_history entry with the result
+            if tool_history and not tool_history[-1][2]:
+                name, args, _ = tool_history[-1]
+                tool_history[-1] = (name, args, tool_result)
+            else:
+                tool_history.append((tool_name, "{}", tool_result))
+        elif role == "assistant":
+            last_assistant_text = content
+
+    # Build compressed system prompt
+    if tool_history:
+        completed_names = [h[0] for h in tool_history]
+        history_lines = []
+        for name, args, result in tool_history:
+            # Truncate long args/results to keep context manageable
+            args_short = args[:200] + ("..." if len(args) > 200 else "")
+            result_short = result[:200] + ("..." if len(result) > 200 else "")
+            history_lines.append(
+                f"  - {name}({args_short}) → {result_short}"
+            )
+        history_section = (
+            "\n\nTools already executed (do NOT call these again):\n"
+            + "\n".join(history_lines)
+        )
+
+        # Find available tools from the original system prompt context
+        # and tell the LLM what to do next
+        history_section += (
+            "\n\nContinue with the next tool that hasn't been called yet. "
+            "Call exactly ONE tool."
+        )
+
+        system_prompt = system_prompt + history_section
+
+    result = [{"role": "system", "content": system_prompt}]
+    if user_message:
+        result.append({"role": "user", "content": user_message})
+    # If there was a non-tool-call assistant message at the end, include it
+    # to maintain conversation flow
+    if last_assistant_text and not tool_history:
+        result.append({"role": "assistant", "content": last_assistant_text})
+
+    return result
+
+
+def _patch_message_flattening(llm: LLM) -> None:
+    """Monkey-patch litellm.completion to flatten tool messages before sending.
+
+    This intercepts at the lowest level — right before the HTTP call — so that
+    openhands-sdk's agent loop sees normal tool_calls/role:tool messages
+    internally, but the gateway only receives flattened user/assistant messages.
+
+    We patch both litellm.completion AND the SDK's cached reference to it.
+    """
+    import litellm as _litellm
+    import openhands.sdk.llm.llm as _sdk_llm_module
+
+    # Only patch once
+    if getattr(_litellm, '_toyshop_patched', False):
+        return
+
+    _original_completion = _sdk_llm_module.litellm_completion
+
+    def _patched_completion(*args, **kwargs):
+        messages = kwargs.get('messages') or (args[1] if len(args) > 1 else None)
+        if messages and any(
+            isinstance(m, dict) and m.get('role') == 'tool' for m in messages
+        ):
+            kwargs['messages'] = _compress_tool_history(messages)
+        return _original_completion(*args, **kwargs)
+
+    # Patch both the litellm module and the SDK's cached reference
+    _litellm.completion = _patched_completion
+    _sdk_llm_module.litellm_completion = _patched_completion
+    _litellm._toyshop_patched = True
 
 
 # ---------------------------------------------------------------------------
