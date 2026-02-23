@@ -606,3 +606,140 @@ class TestGradleTestRunner:
     def test_parse_junit_xml_no_reports(self, runner, tmp_path):
         result = runner._parse_junit_xml(tmp_path)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# TestRunner — RconTestRunner
+# ---------------------------------------------------------------------------
+
+from toyshop.test_runner import RconTestRunner
+
+
+class TestRconTestRunner:
+    """Tests for RconTestRunner (unit-level, no live server)."""
+
+    @pytest.fixture
+    def runner(self):
+        return RconTestRunner()
+
+    def test_parse_output_all_pass(self, runner):
+        output = "[PASS] block_registered:mymod:ruby\n[PASS] block_placeable:mymod:ruby\n\n2/2 passed"
+        result = runner.parse_output(output)
+        assert result.all_passed is True
+        assert result.passed == 2
+        assert result.failed == 0
+
+    def test_parse_output_with_failure(self, runner):
+        output = "[PASS] block_registered:mymod:ruby\n[FAIL] block_placeable:mymod:ruby\n\n1/2 passed"
+        result = runner.parse_output(output)
+        assert result.all_passed is False
+        assert result.passed == 1
+        assert result.failed == 1
+
+    def test_parse_output_empty(self, runner):
+        result = runner.parse_output("")
+        assert result.all_passed is False
+        assert result.total == 0
+
+    def test_load_test_spec(self, tmp_path):
+        import json
+        spec = {"mod_id": "mymod", "blocks": ["ruby_block"], "items": ["ruby"]}
+        (tmp_path / "rcon_tests.json").write_text(json.dumps(spec))
+        loaded = RconTestRunner._load_test_spec(tmp_path, None)
+        assert loaded is not None
+        assert loaded["mod_id"] == "mymod"
+        assert loaded["blocks"] == ["ruby_block"]
+
+    def test_load_test_spec_missing(self, tmp_path):
+        loaded = RconTestRunner._load_test_spec(tmp_path, None)
+        assert loaded is None
+
+    def test_run_tests_no_modfactory(self, runner, tmp_path, monkeypatch):
+        """Without modfactory SDK, should return error gracefully."""
+        import builtins
+        real_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name.startswith("modfactory"):
+                raise ImportError("no modfactory")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", mock_import)
+        result = runner.run_tests(tmp_path)
+        assert result.errors == 1
+        assert "not installed" in result.output
+
+
+# ---------------------------------------------------------------------------
+# TestRunner — VisualTestRunner
+# ---------------------------------------------------------------------------
+
+from toyshop.test_runner import VisualTestRunner
+
+
+class TestVisualTestRunner:
+    """Tests for VisualTestRunner (unit-level, no live client)."""
+
+    @pytest.fixture
+    def runner(self):
+        return VisualTestRunner(vlm_api_key="test-key")
+
+    def test_parse_output_all_pass(self, runner):
+        output = "[PASS] scenario_a\n[PASS] scenario_b\n\n2/2 visual checks passed"
+        result = runner.parse_output(output)
+        assert result.all_passed is True
+        assert result.passed == 2
+
+    def test_parse_output_with_failure(self, runner):
+        output = "[PASS] scenario_a\n[FAIL] scenario_b\n\n1/2 visual checks passed"
+        result = runner.parse_output(output)
+        assert result.all_passed is False
+        assert result.failed == 1
+
+    def test_load_scenarios(self, tmp_path):
+        import json
+        scenarios = [{"name": "test_block", "commands": ["/setblock 0 64 0 mymod:ruby"], "expectations": ["ruby block visible"]}]
+        (tmp_path / "visual_scenarios.json").write_text(json.dumps(scenarios))
+        loaded = VisualTestRunner._load_scenarios(tmp_path)
+        assert loaded is not None
+        assert len(loaded) == 1
+        assert loaded[0]["name"] == "test_block"
+
+    def test_load_scenarios_missing(self, tmp_path):
+        loaded = VisualTestRunner._load_scenarios(tmp_path)
+        assert loaded is None
+
+    def test_run_tests_no_modfactory(self, runner, tmp_path, monkeypatch):
+        """Without modfactory SDK, should return error gracefully."""
+        import builtins
+        real_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name.startswith("modfactory"):
+                raise ImportError("no modfactory")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", mock_import)
+        result = runner.run_tests(tmp_path)
+        assert result.errors == 1
+        assert "not installed" in result.output
+
+
+# ---------------------------------------------------------------------------
+# TestRunner — Registry completeness
+# ---------------------------------------------------------------------------
+
+from toyshop.test_runner import get_test_runner
+
+
+class TestRunnerRegistry:
+    """Verify all expected runners are registered."""
+
+    def test_all_runners_registered(self):
+        for framework in ("pytest", "junit", "rcon", "visual"):
+            runner = get_test_runner(framework)
+            assert runner is not None
+
+    def test_unknown_runner_raises(self):
+        with pytest.raises(KeyError, match="No test runner"):
+            get_test_runner("nonexistent")

@@ -381,12 +381,327 @@ class GradleTestRunner(TestRunner):
 
 
 # ---------------------------------------------------------------------------
+# RCON test runner (Minecraft mod verification — Layer 1A)
+# ---------------------------------------------------------------------------
+
+
+class RconTestRunner(TestRunner):
+    """RCON-based Minecraft mod verification.
+
+    Wraps modfactory.verify_rcon.RCONVerifier to test block/item registration
+    against a running Minecraft server.
+    """
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 25575,
+        password: str = "modtest",
+    ):
+        self.host = host
+        self.port = port
+        self.password = password
+
+    def run_tests(
+        self,
+        workspace: Path,
+        test_dirs: list[str] | None = None,
+        ignore_patterns: list[str] | None = None,
+        timeout: int = 120,
+    ) -> TestRunResult:
+        """Run RCON verification for a mod.
+
+        Expects workspace to contain a mod with metadata we can extract,
+        or test_dirs[0] to be a JSON file with {mod_id, blocks, items}.
+        Falls back to Gradle build if RCON is unavailable.
+        """
+        try:
+            from modfactory.verify_rcon import RCONVerifier
+        except ImportError:
+            return TestRunResult(
+                all_passed=False, total=0, passed=0, failed=0, errors=1,
+                output="modfactory SDK not installed — cannot run RCON tests",
+            )
+
+        # Load test spec from JSON if provided
+        spec = self._load_test_spec(workspace, test_dirs)
+        if not spec:
+            return TestRunResult(
+                all_passed=False, total=0, passed=0, failed=0, errors=1,
+                output="No RCON test spec found (need rcon_tests.json with mod_id/blocks/items)",
+            )
+
+        verifier = RCONVerifier(self.host, self.port, self.password)
+        try:
+            report = verifier.verify_mod(
+                mod_id=spec.get("mod_id", ""),
+                blocks=spec.get("blocks", []),
+                items=spec.get("items", []),
+            )
+        except Exception as e:
+            return TestRunResult(
+                all_passed=False, total=0, passed=0, failed=0, errors=1,
+                output=f"RCON connection failed: {e}",
+            )
+
+        passed = sum(1 for r in report.results if r.passed)
+        failed = sum(1 for r in report.results if not r.passed)
+        per_test = [
+            PerTestResult(
+                test_id=r.name,
+                status="passed" if r.passed else "failed",
+                failure_message=r.reason if not r.passed else "",
+            )
+            for r in report.results
+        ]
+
+        return TestRunResult(
+            all_passed=report.all_passed,
+            total=len(report.results),
+            passed=passed,
+            failed=failed,
+            errors=0,
+            output=report.summary(),
+            per_test=per_test,
+        )
+
+    def run_single_test(
+        self,
+        workspace: Path,
+        test_id: str,
+        timeout: int = 60,
+    ) -> TestRunResult:
+        """Run a single RCON check by test_id (e.g. 'block_registered:mymod:ruby_block')."""
+        try:
+            from modfactory.verify_rcon import RCONVerifier
+            from modfactory.rcon_client import RCONClient
+        except ImportError:
+            return TestRunResult(
+                all_passed=False, total=0, passed=0, failed=0, errors=1,
+                output="modfactory SDK not installed",
+            )
+
+        verifier = RCONVerifier(self.host, self.port, self.password)
+        # Parse test_id: "block_registered:mod_id:block_name"
+        parts = test_id.split(":", 2)
+        if len(parts) < 3:
+            return TestRunResult(
+                all_passed=False, total=0, passed=0, failed=0, errors=1,
+                output=f"Invalid RCON test_id format: {test_id}",
+            )
+
+        check_type, mod_id, name = parts
+        try:
+            with RCONClient(self.host, self.port, self.password) as rcon:
+                if check_type == "block_registered":
+                    result = verifier.verify_block_registered(rcon, mod_id, name)
+                elif check_type == "block_placeable":
+                    result = verifier.verify_block_placeable(rcon, mod_id, name)
+                else:
+                    return TestRunResult(
+                        all_passed=False, total=0, passed=0, failed=0, errors=1,
+                        output=f"Unknown RCON check type: {check_type}",
+                    )
+        except Exception as e:
+            return TestRunResult(
+                all_passed=False, total=0, passed=0, failed=0, errors=1,
+                output=f"RCON connection failed: {e}",
+            )
+
+        return TestRunResult(
+            all_passed=result.passed,
+            total=1,
+            passed=1 if result.passed else 0,
+            failed=0 if result.passed else 1,
+            errors=0,
+            output=f"[{'PASS' if result.passed else 'FAIL'}] {result.name}: {result.response}",
+            per_test=[PerTestResult(
+                test_id=result.name,
+                status="passed" if result.passed else "failed",
+                failure_message=result.reason if not result.passed else "",
+            )],
+        )
+
+    def parse_output(self, output: str) -> TestRunResult:
+        """Parse RCON verification summary output."""
+        passed = 0
+        failed = 0
+        for line in output.split("\n"):
+            if line.startswith("[PASS]"):
+                passed += 1
+            elif line.startswith("[FAIL]"):
+                failed += 1
+        total = passed + failed
+        return TestRunResult(
+            all_passed=total > 0 and failed == 0,
+            total=total, passed=passed, failed=failed, errors=0,
+            output=output,
+        )
+
+    @staticmethod
+    def _load_test_spec(workspace: Path, test_dirs: list[str] | None) -> dict | None:
+        """Load RCON test spec from rcon_tests.json."""
+        import json
+        candidates = [workspace / "rcon_tests.json"]
+        if test_dirs:
+            for td in test_dirs:
+                candidates.append(workspace / td / "rcon_tests.json")
+                # Also allow test_dirs[0] to be the JSON file itself
+                candidates.append(workspace / td)
+
+        for path in candidates:
+            if path.exists() and path.suffix == ".json":
+                try:
+                    return json.loads(path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    continue
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Visual test runner (Minecraft mod verification — Layer 2)
+# ---------------------------------------------------------------------------
+
+
+class VisualTestRunner(TestRunner):
+    """Visual confirmation via screenshot + Claude Vision.
+
+    Wraps modfactory.visual_confirm to capture screenshots from a running
+    Minecraft client and analyze them with a VLM.
+    """
+
+    def __init__(self, vlm_api_key: str | None = None):
+        import os
+        self.vlm_api_key = vlm_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+
+    def run_tests(
+        self,
+        workspace: Path,
+        test_dirs: list[str] | None = None,
+        ignore_patterns: list[str] | None = None,
+        timeout: int = 300,
+    ) -> TestRunResult:
+        """Run visual confirmation scenarios.
+
+        Expects workspace to contain visual_scenarios.json with scenario definitions.
+        """
+        try:
+            from modfactory.visual_confirm import run_visual_confirm, VisualScenario
+            from modfactory.report import ReportBuilder
+        except ImportError:
+            return TestRunResult(
+                all_passed=False, total=0, passed=0, failed=0, errors=1,
+                output="modfactory SDK not installed — cannot run visual tests",
+            )
+
+        scenarios_data = self._load_scenarios(workspace)
+        if not scenarios_data:
+            return TestRunResult(
+                all_passed=False, total=0, passed=0, failed=0, errors=1,
+                output="No visual_scenarios.json found in workspace",
+            )
+
+        scenarios = [VisualScenario(**s) for s in scenarios_data]
+        report = ReportBuilder(title="ToyShop Visual Test")
+
+        try:
+            result = run_visual_confirm(
+                scenarios=scenarios,
+                report=report,
+                vlm_api_key=self.vlm_api_key,
+                timeout=timeout,
+            )
+        except Exception as e:
+            return TestRunResult(
+                all_passed=False, total=0, passed=0, failed=0, errors=1,
+                output=f"Visual confirmation failed: {e}",
+            )
+
+        per_test: list[PerTestResult] = []
+        passed_count = 0
+        failed_count = 0
+
+        if result.visual:
+            for vr in result.visual.results:
+                per_test.append(PerTestResult(
+                    test_id=f"visual:{vr.scenario_name}",
+                    status="passed" if vr.passed else "failed",
+                    failure_message="; ".join(vr.issues) if vr.issues else "",
+                ))
+                if vr.passed:
+                    passed_count += 1
+                else:
+                    failed_count += 1
+
+        total = passed_count + failed_count
+        return TestRunResult(
+            all_passed=result.passed,
+            total=total,
+            passed=passed_count,
+            failed=failed_count,
+            errors=0,
+            output=result.summary(),
+            per_test=per_test,
+        )
+
+    def run_single_test(
+        self,
+        workspace: Path,
+        test_id: str,
+        timeout: int = 120,
+    ) -> TestRunResult:
+        """Run a single visual scenario by name."""
+        # Visual tests are expensive — just run all and filter
+        full = self.run_tests(workspace, timeout=timeout)
+        matching = [p for p in full.per_test if test_id in p.test_id]
+        if not matching:
+            return TestRunResult(
+                all_passed=False, total=0, passed=0, failed=0, errors=1,
+                output=f"Visual scenario '{test_id}' not found",
+            )
+        r = matching[0]
+        return TestRunResult(
+            all_passed=r.status == "passed",
+            total=1,
+            passed=1 if r.status == "passed" else 0,
+            failed=0 if r.status == "passed" else 1,
+            errors=0,
+            output=f"[{r.status.upper()}] {r.test_id}",
+            per_test=[r],
+        )
+
+    def parse_output(self, output: str) -> TestRunResult:
+        """Parse visual confirmation summary."""
+        passed = output.count("[PASS]")
+        failed = output.count("[FAIL]")
+        total = passed + failed
+        return TestRunResult(
+            all_passed=total > 0 and failed == 0,
+            total=total, passed=passed, failed=failed, errors=0,
+            output=output,
+        )
+
+    @staticmethod
+    def _load_scenarios(workspace: Path) -> list[dict] | None:
+        import json
+        path = workspace / "visual_scenarios.json"
+        if path.exists():
+            try:
+                return json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                return None
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
 _RUNNER_REGISTRY: dict[str, type[TestRunner]] = {
     "pytest": PytestRunner,
     "junit": GradleTestRunner,
+    "rcon": RconTestRunner,
+    "visual": VisualTestRunner,
 }
 
 
