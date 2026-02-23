@@ -6,7 +6,6 @@ test suite state per version, and an audit changelog.
 
 from __future__ import annotations
 
-import ast
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -436,46 +435,18 @@ def get_changelog(
 
 def extract_test_metadata(
     workspace: Path,
+    language: str = "python",
 ) -> tuple[list[str], list[dict[str, str]]]:
-    """Scan tests/ directory and extract test case metadata via AST.
+    """Scan tests/ directory and extract test case metadata.
+
+    Delegates to the appropriate LanguageSupport implementation.
 
     Returns:
         (test_files, test_cases) where test_cases is a list of dicts with
         keys: id, name, file, class_name (empty string for top-level funcs).
     """
-    test_dir = Path(workspace) / "tests"
-    if not test_dir.exists():
-        return [], []
+    from toyshop.lang.base import get_language_support
+    import toyshop.lang.python_lang  # noqa: F401 — ensure registration
 
-    test_files: list[str] = []
-    test_cases: list[dict[str, str]] = []
-
-    for py_file in sorted(test_dir.rglob("test_*.py")):
-        rel_path = str(py_file.relative_to(workspace))
-        test_files.append(rel_path)
-
-        try:
-            source = py_file.read_text(encoding="utf-8")
-            tree = ast.parse(source)
-        except (SyntaxError, UnicodeDecodeError):
-            continue
-
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
-                test_cases.append({
-                    "id": f"{rel_path}::{node.name}",
-                    "name": node.name,
-                    "file": rel_path,
-                    "class_name": "",
-                })
-            elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-                for item in node.body:
-                    if isinstance(item, ast.FunctionDef) and item.name.startswith("test_"):
-                        test_cases.append({
-                            "id": f"{rel_path}::{node.name}::{item.name}",
-                            "name": item.name,
-                            "file": rel_path,
-                            "class_name": node.name,
-                        })
-
-    return test_files, test_cases
+    lang = get_language_support(language)
+    return lang.extract_test_metadata(workspace)

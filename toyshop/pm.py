@@ -63,6 +63,7 @@ class BatchState:
     status: str = "pending"  # pending | in_progress | completed | failed
     tasks: list[TaskState] = field(default_factory=list)
     error: str | None = None
+    project_type: str = "python"  # "python" | "java" | "java-minecraft" | "json-minecraft"
 
 
 # =============================================================================
@@ -94,6 +95,7 @@ def _save_progress(batch: BatchState) -> None:
     _write_json(batch.batch_dir / "progress.json", {
         "batch_id": batch.batch_id,
         "project_name": batch.project_name,
+        "project_type": batch.project_type,
         "status": batch.status,
         "total_tasks": len(batch.tasks),
         "completed_tasks": completed,
@@ -240,6 +242,7 @@ def create_batch(
     pm_root: str | Path,
     project_name: str,
     user_input: str,
+    project_type: str = "python",
 ) -> BatchState:
     """Create a new batch folder with requirements.md."""
     pm_root = Path(pm_root)
@@ -261,6 +264,7 @@ def create_batch(
         project_name=project_name,
         batch_dir=batch_dir,
         status="pending",
+        project_type=project_type,
     )
     _save_progress(batch)
     print(f"[PM] Created batch: {batch_dir}")
@@ -472,7 +476,7 @@ def run_batch_tdd(batch: BatchState, llm: LLM, mode: str = "create") -> TDDResul
     Args:
         mode: "create" for greenfield, "modify" for change pipeline.
     """
-    print(f"[PM] Running TDD pipeline for batch (mode={mode})")
+    print(f"[PM] Running TDD pipeline for batch (mode={mode}, type={batch.project_type})")
     batch.status = "in_progress"
     _save_progress(batch)
 
@@ -494,6 +498,7 @@ def run_batch_tdd(batch: BatchState, llm: LLM, mode: str = "create") -> TDDResul
             llm=llm,
             mode=mode,
             log_dir=log_dir,
+            project_type=batch.project_type,
         )
     except Exception as e:
         batch.status = "failed"
@@ -535,13 +540,14 @@ def run_batch(
     project_name: str,
     user_input: str,
     llm: LLM | None = None,
+    project_type: str = "python",
 ) -> BatchState:
     """End-to-end: create batch → generate specs → parse tasks → run TDD pipeline."""
     if llm is None:
         llm = create_llm()
 
     # Step 1: Create batch
-    batch = create_batch(pm_root, project_name, user_input)
+    batch = create_batch(pm_root, project_name, user_input, project_type=project_type)
 
     # Step 2: Generate openspec docs
     batch = run_spec_generation(batch, llm)
@@ -570,6 +576,7 @@ def load_batch(batch_dir: str | Path) -> BatchState:
         project_name=progress["project_name"],
         batch_dir=batch_dir,
         status=progress.get("status", "pending"),
+        project_type=progress.get("project_type", "python"),
     )
 
     # Reload tasks from task.json files
@@ -626,6 +633,7 @@ def create_change_batch(
     project_name: str,
     workspace_path: str | Path,
     change_request: str,
+    project_type: str = "python",
 ) -> BatchState:
     """Create a change batch from an existing workspace + change request.
 
@@ -664,10 +672,12 @@ def create_change_batch(
         project_name=project_name,
         batch_dir=batch_dir,
         status="pending",
+        project_type=project_type,
     )
     _write_json(batch_dir / "batch_meta.json", {
         "type": "change",
         "source_workspace": str(workspace_path),
+        "project_type": project_type,
     })
     _save_progress(batch)
     print(f"[PM] Created change batch: {batch_dir}")

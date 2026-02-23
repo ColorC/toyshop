@@ -38,6 +38,12 @@ from openhands.sdk.tool import (
     register_tool,
 )
 
+# Cross-language abstraction layer (Phase 1)
+from toyshop.project_type import get_project_type, ProjectType
+from toyshop.lang.base import get_language_support, LanguageSupport
+from toyshop.test_runner import get_test_runner, TestRunner as _TestRunner, PytestRunner
+import toyshop.lang.python_lang  # noqa: F401 — trigger auto-registration
+
 # Import tools to trigger registration
 import openhands.tools.terminal  # noqa: F401
 import openhands.tools.glob  # noqa: F401
@@ -850,15 +856,19 @@ def _to_snake_case(name: str) -> str:
     return s.lower()
 
 
-def extract_signatures(workspace: Path, mode: str = "create") -> SignatureManifest:
+def extract_signatures(workspace: Path, mode: str = "create", lang: LanguageSupport | None = None) -> SignatureManifest:
     """Parse openspec/design.md and generate stub files.
 
     Args:
         workspace: Project workspace directory
         mode: "create" overwrites stubs; "modify" preserves existing code files
+        lang: LanguageSupport instance (defaults to Python)
 
     Returns a SignatureManifest with paths to generated stubs.
     """
+    if lang is None:
+        lang = get_language_support("python")
+
     design_path = workspace / "openspec" / "design.md"
     if not design_path.exists():
         return SignatureManifest(stub_files=[], test_dir="tests", modules=[], interfaces=[])
@@ -870,9 +880,9 @@ def extract_signatures(workspace: Path, mode: str = "create") -> SignatureManife
     if not interfaces:
         return SignatureManifest(stub_files=[], test_dir="tests", modules=modules, interfaces=interfaces)
 
-    # Filter to Python-only interfaces
-    py_interfaces = [i for i in interfaces if _is_python_signature(i["signature"])]
-    if not py_interfaces:
+    # Filter to valid interfaces for this language
+    valid_interfaces = [i for i in interfaces if lang.is_valid_signature(i["signature"])]
+    if not valid_interfaces:
         return SignatureManifest(stub_files=[], test_dir="tests", modules=modules, interfaces=interfaces)
 
     # Build module_map for resolving file paths
@@ -892,7 +902,7 @@ def extract_signatures(workspace: Path, mode: str = "create") -> SignatureManife
 
     # Group interfaces by module
     by_module: dict[str, list[dict[str, str]]] = {}
-    for iface in py_interfaces:
+    for iface in valid_interfaces:
         mod_id = iface.get("module", "").strip()
         if not mod_id:
             mod_id = "_misc"
@@ -932,7 +942,7 @@ def extract_signatures(workspace: Path, mode: str = "create") -> SignatureManife
             # Preserve existing code in modify mode
             pass
         else:
-            stub_code = _generate_stub_code_for_module(mod_ifaces)
+            stub_code = lang.generate_stub_for_module(mod_ifaces)
             stub_path.write_text(stub_code, encoding="utf-8")
 
         stub_files.append(str(stub_path.relative_to(workspace)))
@@ -942,8 +952,8 @@ def extract_signatures(workspace: Path, mode: str = "create") -> SignatureManife
     test_dir.mkdir(parents=True, exist_ok=True)
 
     # Phase 1.5: Generate test skeletons with correct imports
-    module_map = _build_module_map(modules)
-    skeleton_files = _generate_test_skeletons(
+    module_map = lang.build_module_map(modules)
+    skeleton_files = lang.generate_test_skeletons(
         interfaces, module_map, workspace, mode=mode,
     )
 
@@ -1816,17 +1826,19 @@ def run_tdd_pipeline(
     project_id: str | None = None,
     change_request: str | None = None,
     log_dir: Path | None = None,
+    project_type: str | None = None,
 ) -> TDDResult:
     """Run the TDD pipeline: signatures → tests → code → verify.
 
     Args:
         workspace: Directory containing openspec/ design documents
         llm: LLM instance (created from config if not provided)
-        language: Target language
+        language: Target language (deprecated, use project_type)
         mode: "create" for greenfield, "modify" for brownfield
         project_id: Project ID for loading architecture (modify mode)
         change_request: Description of changes (modify mode)
         log_dir: If set, save agent conversation logs to this directory
+        project_type: Project type ID (e.g. "python", "java"). Overrides language.
 
     Returns:
         TDDResult with full pipeline results
@@ -1838,9 +1850,19 @@ def run_tdd_pipeline(
 
     workspace = Path(workspace)
 
+    # Resolve cross-language abstractions
+    _pt_id = project_type or language or "python"
+    try:
+        pt = get_project_type(_pt_id)
+    except KeyError:
+        # Fallback: treat language as project_type ID
+        pt = get_project_type("python")
+    lang = get_language_support(pt.language)
+    runner = PytestRunner()  # Phase 2: will use get_test_runner(pt.test_framework)
+
     # ── Phase 1: Signature Extraction ──
     print("[TDD] Phase 1: Signature Extraction")
-    manifest = extract_signatures(workspace, mode=mode)
+    manifest = extract_signatures(workspace, mode=mode, lang=lang)
     print(f"  Stubs: {manifest.stub_files}")
     print(f"  Interfaces: {len(manifest.interfaces)}")
     if manifest.skeleton_files:
@@ -1947,16 +1969,7 @@ def run_tdd_pipeline(
     # Build smoke test command from stub modules
     stub_modules = []
     for sf in manifest.stub_files:
-        p = Path(sf)
-        # Convert path like "calculator/config.py" to "calculator.config"
-        parts = list(p.parts)
-        if parts[-1].endswith(".py"):
-            parts[-1] = parts[-1][:-3]
-        # "calculator/__init__" → "calculator"
-        if parts and parts[-1] == "__init__":
-            parts = parts[:-1]
-        if parts:
-            stub_modules.append(".".join(parts))
+        stub_modules.append(lang.module_path_from_file(sf))
     # Deduplicate while preserving order
     seen = set()
     unique_modules = []
@@ -1965,8 +1978,7 @@ def run_tdd_pipeline(
             seen.add(m)
             unique_modules.append(m)
     stub_modules = unique_modules
-    smoke_imports = "; ".join(f"import {m}" for m in stub_modules) if stub_modules else "print('no stubs')"
-    smoke_cmd = f"python3 -c '{smoke_imports}; print(\"smoke ok\")'"
+    smoke_cmd = lang.build_smoke_command(stub_modules)
 
     code_agent = create_code_agent_smoke(llm, mode=mode)
     code_conv = Conversation(agent=code_agent, workspace=str(workspace))
@@ -2004,7 +2016,7 @@ def run_tdd_pipeline(
     for ac in workspace.glob("tests/test_anticheat_*.py"):
         ignore_pats.append(str(ac.relative_to(workspace)))
 
-    wb_results = run_tests_automated(workspace, ["tests/"], ignore_pats)
+    wb_results = runner.run_tests(workspace, ["tests/"], ignore_pats)
     whitebox_output = wb_results.output
     print(f"  White-box: {wb_results.passed} passed, {wb_results.failed} failed, {wb_results.errors} errors")
 
@@ -2056,7 +2068,7 @@ def run_tdd_pipeline(
                     break
 
             # Phase 4.7: Anti-cheat for flipped tests
-            after_results = run_tests_automated(workspace, ["tests/"], ignore_pats)
+            after_results = runner.run_tests(workspace, ["tests/"], ignore_pats)
             anticheat_files = _run_anticheat(
                 workspace, llm, baseline_results, after_results,
                 round_num=debug_retry + 1, log_dir=log_dir,
@@ -2064,7 +2076,7 @@ def run_tdd_pipeline(
 
             # Re-run all tests (including anticheat)
             all_ignore = [p for p in ignore_pats if "anticheat" not in p]
-            final_results = run_tests_automated(workspace, ["tests/"], all_ignore)
+            final_results = runner.run_tests(workspace, ["tests/"], all_ignore)
             whitebox_output = final_results.output
             print(f"  After round {debug_retry + 1}: {final_results.passed} passed, {final_results.failed} failed")
 
@@ -2116,7 +2128,7 @@ def run_tdd_pipeline(
 
         if bb_test_file.exists():
             print("[TDD] Phase 5b: Black-box Verification (auto)")
-            bb_results = run_tests_automated(
+            bb_results = runner.run_tests(
                 workspace, ["tests/test_blackbox_auto.py"],
             )
             blackbox_output = bb_results.output

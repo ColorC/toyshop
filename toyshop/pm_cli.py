@@ -36,7 +36,8 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     user_input = _read_input(args.input)
     llm = create_llm()
-    batch = run_batch(Path(args.pm_root), args.name, user_input, llm)
+    batch = run_batch(Path(args.pm_root), args.name, user_input, llm,
+                      project_type=args.project_type)
     _print_result(batch)
 
 
@@ -45,7 +46,7 @@ def cmd_create(args: argparse.Namespace) -> None:
     from toyshop.pm import create_batch
 
     user_input = _read_input(args.input)
-    batch = create_batch(Path(args.pm_root), args.name, user_input)
+    batch = create_batch(Path(args.pm_root), args.name, user_input, project_type=args.project_type)
     print(f"Batch dir: {batch.batch_dir}")
     print("Next: python3 -m toyshop.pm_cli spec --batch <batch_dir>")
 
@@ -158,6 +159,7 @@ def cmd_change_create(args: argparse.Namespace) -> None:
     change_request = _read_input(args.input)
     batch = create_change_batch(
         Path(args.pm_root), args.name, Path(args.workspace), change_request,
+        project_type=args.project_type,
     )
     print(f"Batch dir: {batch.batch_dir}")
     print("Next: python3 -m toyshop.pm_cli change-analyze --batch", batch.batch_dir)
@@ -369,12 +371,16 @@ def main() -> None:
     p_run.add_argument("--name", required=True)
     p_run.add_argument("--input", required=True, help="Requirements text or path to .md file")
     p_run.add_argument("--pm-root", default=str(Path.home() / ".toyshop" / "projects"))
+    p_run.add_argument("--type", dest="project_type", default="python",
+                        help="Project type: python, java, java-minecraft, json-minecraft")
 
     # create (step 1)
     p_create = sub.add_parser("create", help="Step 1: Create batch with requirements")
     p_create.add_argument("--name", required=True)
     p_create.add_argument("--input", required=True)
     p_create.add_argument("--pm-root", default=str(Path.home() / ".toyshop" / "projects"))
+    p_create.add_argument("--type", dest="project_type", default="python",
+                          help="Project type: python, java, java-minecraft, json-minecraft")
 
     # spec (step 2)
     p_spec = sub.add_parser("spec", help="Step 2: Generate openspec docs")
@@ -402,6 +408,8 @@ def main() -> None:
     p_cc.add_argument("--workspace", required=True, help="Path to existing workspace")
     p_cc.add_argument("--input", required=True, help="Change request text or path to .md file")
     p_cc.add_argument("--pm-root", default=str(Path.home() / ".toyshop" / "projects"))
+    p_cc.add_argument("--type", dest="project_type", default="python",
+                      help="Project type: python, java, java-minecraft, json-minecraft")
 
     # change-analyze
     p_ca = sub.add_parser("change-analyze", help="Change step 2: Snapshot + impact analysis")

@@ -24,8 +24,22 @@ pytestmark = [
 
 @pytest.fixture
 def llm():
-    """Create LLM instance from openhands config."""
-    return create_llm()
+    """Create LLM instance from openhands config. Skip if LLM service unavailable."""
+    _llm = create_llm()
+    # Quick connectivity check — skip entire test if LLM service is down
+    import litellm
+    try:
+        litellm.completion(
+            model=_llm.model,
+            messages=[{"role": "user", "content": "ping"}],
+            api_key=_llm.api_key.get_secret_value() if _llm.api_key else None,
+            base_url=_llm.base_url,
+            max_tokens=5,
+            timeout=15,
+        )
+    except Exception as e:
+        pytest.skip(f"LLM service unavailable: {e}")
+    return _llm
 
 
 @pytest.fixture

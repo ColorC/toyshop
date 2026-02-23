@@ -31,8 +31,20 @@ pytestmark = [
 
 @pytest.fixture
 def llm():
-    """Create LLM instance from openhands config."""
-    return create_toyshop_llm()
+    """Create LLM instance from openhands config. Skip if LLM service unavailable."""
+    _llm = create_toyshop_llm()
+    # Quick connectivity check — skip entire test if LLM service is down
+    try:
+        from openhands.sdk.llm.message import Message, TextContent
+        _llm.completion(
+            messages=[
+                Message(role="user", content=[TextContent(text="ping")])
+            ],
+            max_tokens=5,
+        )
+    except Exception as e:
+        pytest.skip(f"LLM service unavailable: {e}")
+    return _llm
 
 
 @pytest.fixture

@@ -64,6 +64,8 @@ def _create_tables() -> None:
                 name TEXT NOT NULL,
                 root_path TEXT NOT NULL,
                 current_version TEXT DEFAULT '1.0.0',
+                project_type TEXT DEFAULT 'python',
+                language TEXT DEFAULT 'python',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -174,7 +176,7 @@ def _create_tables() -> None:
 # ---------------------------------------------------------------------------
 
 
-def create_project(name: str, root_path: str) -> dict[str, Any]:
+def create_project(name: str, root_path: str, project_type: str = "python", language: str = "python") -> dict[str, Any]:
     """Create a new project record."""
     import uuid
     now = datetime.utcnow().isoformat()
@@ -183,10 +185,10 @@ def create_project(name: str, root_path: str) -> dict[str, Any]:
     with transaction() as cur:
         cur.execute(
             """
-            INSERT INTO projects (id, name, root_path, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO projects (id, name, root_path, project_type, language, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (project_id, name, root_path, now, now),
+            (project_id, name, root_path, project_type, language, now, now),
         )
 
     return {
@@ -194,6 +196,8 @@ def create_project(name: str, root_path: str) -> dict[str, Any]:
         "name": name,
         "root_path": root_path,
         "current_version": "1.0.0",
+        "project_type": project_type,
+        "language": language,
         "created_at": now,
         "updated_at": now,
     }
