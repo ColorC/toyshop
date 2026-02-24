@@ -170,6 +170,78 @@ def _create_tables() -> None:
             )
         """)
 
+        # --- Project norms ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS project_norms (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                norm_type TEXT NOT NULL,
+                norm_name TEXT NOT NULL,
+                norm_description TEXT NOT NULL DEFAULT '',
+                norm_rules_json TEXT NOT NULL DEFAULT '[]',
+                severity TEXT NOT NULL DEFAULT 'warning',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        """)
+
+        # --- Architecture health history ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS architecture_health_history (
+                id TEXT PRIMARY KEY,
+                version_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                warning_count INTEGER NOT NULL DEFAULT 0,
+                checked_at TEXT NOT NULL,
+                FOREIGN KEY (version_id) REFERENCES wiki_versions(id),
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        """)
+
+        # --- Run events ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS run_events (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                batch_id TEXT,
+                event_type TEXT NOT NULL,
+                event_data_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        """)
+
+        # --- Workflow runs (pipeline execution tracking) ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS workflow_runs (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                workflow_type TEXT NOT NULL,
+                batch_id TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                result_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        """)
+
+        # --- Change plans (impact analysis records) ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS change_plans (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                version_id TEXT,
+                change_request TEXT NOT NULL,
+                impact_json TEXT,
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        """)
+
 
 # ---------------------------------------------------------------------------
 # Project operations
@@ -323,3 +395,275 @@ def get_latest_snapshot(project_id: str) -> dict[str, Any] | None:
         result["interfaces"] = json.loads(result.get("interfaces_json", "[]"))
         return result
     return None
+
+
+# ---------------------------------------------------------------------------
+# Project query helpers
+# ---------------------------------------------------------------------------
+
+
+def list_projects() -> list[dict[str, Any]]:
+    """List all projects."""
+    db = get_db()
+    cur = db.execute("SELECT * FROM projects ORDER BY created_at DESC")
+    return [dict(row) for row in cur.fetchall()]
+
+
+def find_project_by_path(root_path: str) -> dict[str, Any] | None:
+    """Find a project by its root_path."""
+    db = get_db()
+    cur = db.execute("SELECT * FROM projects WHERE root_path = ?", (root_path,))
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Project norms
+# ---------------------------------------------------------------------------
+
+
+def save_project_norm(
+    project_id: str,
+    norm_type: str,
+    norm_name: str,
+    description: str = "",
+    rules: list[str] | None = None,
+    severity: str = "warning",
+) -> dict[str, Any]:
+    """Save a project norm."""
+    import uuid
+    now = datetime.utcnow().isoformat()
+    norm_id = str(uuid.uuid4())[:8]
+
+    with transaction() as cur:
+        cur.execute(
+            """INSERT INTO project_norms
+            (id, project_id, norm_type, norm_name, norm_description,
+             norm_rules_json, severity, created_at)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (norm_id, project_id, norm_type, norm_name, description,
+             json.dumps(rules or []), severity, now),
+        )
+
+    return {
+        "id": norm_id,
+        "project_id": project_id,
+        "norm_type": norm_type,
+        "norm_name": norm_name,
+        "norm_description": description,
+        "norm_rules_json": json.dumps(rules or []),
+        "severity": severity,
+        "created_at": now,
+    }
+
+
+def get_project_norms(
+    project_id: str,
+    norm_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """Get project norms, optionally filtered by type."""
+    db = get_db()
+    if norm_type:
+        cur = db.execute(
+            "SELECT * FROM project_norms WHERE project_id = ? AND norm_type = ? ORDER BY created_at",
+            (project_id, norm_type),
+        )
+    else:
+        cur = db.execute(
+            "SELECT * FROM project_norms WHERE project_id = ? ORDER BY created_at",
+            (project_id,),
+        )
+    results = []
+    for row in cur.fetchall():
+        d = dict(row)
+        d["rules"] = json.loads(d.get("norm_rules_json", "[]"))
+        results.append(d)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Architecture health history
+# ---------------------------------------------------------------------------
+
+
+def save_health_check(
+    version_id: str,
+    project_id: str,
+    warnings: list[str],
+) -> dict[str, Any]:
+    """Save architecture health check results for a version."""
+    import uuid
+    now = datetime.utcnow().isoformat()
+    check_id = str(uuid.uuid4())[:8]
+
+    with transaction() as cur:
+        cur.execute(
+            """INSERT INTO architecture_health_history
+            (id, version_id, project_id, warnings_json, warning_count, checked_at)
+            VALUES (?,?,?,?,?,?)""",
+            (check_id, version_id, project_id, json.dumps(warnings),
+             len(warnings), now),
+        )
+
+    return {
+        "id": check_id,
+        "version_id": version_id,
+        "project_id": project_id,
+        "warnings": warnings,
+        "warning_count": len(warnings),
+        "checked_at": now,
+    }
+
+
+def get_health_history(
+    project_id: str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Get architecture health check history for a project."""
+    db = get_db()
+    cur = db.execute(
+        "SELECT * FROM architecture_health_history WHERE project_id = ? "
+        "ORDER BY checked_at DESC LIMIT ?",
+        (project_id, limit),
+    )
+    results = []
+    for row in cur.fetchall():
+        d = dict(row)
+        d["warnings"] = json.loads(d.get("warnings_json", "[]"))
+        results.append(d)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Workflow runs
+# ---------------------------------------------------------------------------
+
+
+def create_workflow_run(
+    project_id: str,
+    workflow_type: str,
+    batch_id: str | None = None,
+) -> dict[str, Any]:
+    """Create a new workflow run record (status=running)."""
+    import uuid
+    now = datetime.utcnow().isoformat()
+    run_id = str(uuid.uuid4())[:8]
+
+    with transaction() as cur:
+        cur.execute(
+            """INSERT INTO workflow_runs
+            (id, project_id, workflow_type, batch_id, status, started_at, created_at)
+            VALUES (?,?,?,?,?,?,?)""",
+            (run_id, project_id, workflow_type, batch_id, "running", now, now),
+        )
+
+    return {
+        "id": run_id,
+        "project_id": project_id,
+        "workflow_type": workflow_type,
+        "batch_id": batch_id,
+        "status": "running",
+        "started_at": now,
+    }
+
+
+def complete_workflow_run(
+    run_id: str,
+    status: str,
+    result: dict[str, Any] | None = None,
+) -> None:
+    """Mark a workflow run as completed/failed."""
+    now = datetime.utcnow().isoformat()
+    with transaction() as cur:
+        cur.execute(
+            """UPDATE workflow_runs
+            SET status = ?, completed_at = ?, result_json = ?
+            WHERE id = ?""",
+            (status, now, json.dumps(result) if result else None, run_id),
+        )
+
+
+def get_workflow_runs(
+    project_id: str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Get workflow run history for a project."""
+    db = get_db()
+    cur = db.execute(
+        "SELECT * FROM workflow_runs WHERE project_id = ? "
+        "ORDER BY created_at DESC LIMIT ?",
+        (project_id, limit),
+    )
+    results = []
+    for row in cur.fetchall():
+        d = dict(row)
+        if d.get("result_json"):
+            d["result"] = json.loads(d["result_json"])
+        else:
+            d["result"] = None
+        results.append(d)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Change plans
+# ---------------------------------------------------------------------------
+
+
+def create_change_plan(
+    project_id: str,
+    change_request: str,
+    version_id: str | None = None,
+    impact_json: str | None = None,
+) -> dict[str, Any]:
+    """Create a change plan record."""
+    import uuid
+    now = datetime.utcnow().isoformat()
+    plan_id = str(uuid.uuid4())[:8]
+
+    with transaction() as cur:
+        cur.execute(
+            """INSERT INTO change_plans
+            (id, project_id, version_id, change_request, impact_json, status, created_at)
+            VALUES (?,?,?,?,?,?,?)""",
+            (plan_id, project_id, version_id, change_request, impact_json, "draft", now),
+        )
+
+    return {
+        "id": plan_id,
+        "project_id": project_id,
+        "version_id": version_id,
+        "change_request": change_request,
+        "status": "draft",
+        "created_at": now,
+    }
+
+
+def get_change_plans(
+    project_id: str,
+    status: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Get change plans for a project."""
+    db = get_db()
+    if status:
+        cur = db.execute(
+            "SELECT * FROM change_plans WHERE project_id = ? AND status = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (project_id, status, limit),
+        )
+    else:
+        cur = db.execute(
+            "SELECT * FROM change_plans WHERE project_id = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (project_id, limit),
+        )
+    results = []
+    for row in cur.fetchall():
+        d = dict(row)
+        if d.get("impact_json"):
+            d["impact"] = json.loads(d["impact_json"])
+        else:
+            d["impact"] = None
+        results.append(d)
+    return results

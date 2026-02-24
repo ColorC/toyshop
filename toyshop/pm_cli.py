@@ -59,6 +59,7 @@ def cmd_run_phased(args: argparse.Namespace) -> None:
         auto_continue_sota=not args.stop_after_mvp,
         enable_research_agent=not args.skip_research,
         research_timebox_minutes=args.research_timebox,
+        auto_approve_research=not args.pause_for_review,
     )
     _print_result(batch)
 
@@ -205,6 +206,53 @@ def cmd_research_deadlock(args: argparse.Namespace) -> None:
     print(f"  mvp_scope_count: {len(plan.mvp_scope)}")
     print(f"  sources_count: {len(plan.sources)}")
     print(f"Artifacts: {Path(args.batch) / 'research'}")
+
+
+def cmd_review(args: argparse.Namespace) -> None:
+    """Show current review checkpoint and artifacts for a batch."""
+    batch_dir = Path(args.batch)
+    cp_path = batch_dir / "review_checkpoint.json"
+    if not cp_path.exists():
+        print("No review checkpoint found.")
+        return
+
+    cp = json.loads(cp_path.read_text(encoding="utf-8"))
+    print(f"Review checkpoint: {cp['checkpoint_type']}")
+    print(f"  Status: {cp['status']}")
+    print(f"  Created: {cp['created_at']}")
+    if cp.get("reviewer_notes"):
+        print(f"  Notes: {cp['reviewer_notes']}")
+    print("\nArtifacts to review:")
+    for a in cp.get("artifacts_to_review", []):
+        full_path = batch_dir / a
+        exists = "✓" if full_path.exists() else "✗"
+        print(f"  {exists} {a}")
+        if full_path.exists() and a.endswith(".md"):
+            content = full_path.read_text(encoding="utf-8")
+            # Show first 20 lines
+            for line in content.split("\n")[:20]:
+                print(f"    {line}")
+            if content.count("\n") > 20:
+                print("    ...")
+
+
+def cmd_approve(args: argparse.Namespace) -> None:
+    """Approve the review checkpoint and allow pipeline to continue."""
+    from toyshop.pm import approve_review
+    approve_review(Path(args.batch), reviewer_notes=args.notes or "")
+    print("Review approved.")
+    print("Resume with: python3 -m toyshop.pm_cli resume --batch", args.batch)
+
+
+def cmd_reject(args: argparse.Namespace) -> None:
+    """Reject the review checkpoint with feedback."""
+    from toyshop.pm import reject_review
+    if not args.notes:
+        print("Error: --notes is required for rejection.")
+        sys.exit(1)
+    reject_review(Path(args.batch), reviewer_notes=args.notes)
+    print("Review rejected with notes.")
+    print("Re-run research or resume with: python3 -m toyshop.pm_cli resume --batch", args.batch)
 
 
 def cmd_change_create(args: argparse.Namespace) -> None:
@@ -397,6 +445,73 @@ def cmd_wiki_commit(args: argparse.Namespace) -> None:
     print(f"Bound v{version.version_number} → {commit_hash[:8]}")
 
 
+def cmd_bootstrap(args: argparse.Namespace) -> None:
+    """Bootstrap an existing project into the wiki."""
+    from toyshop.storage.database import init_database
+    from toyshop.storage.wiki import bootstrap_project, bootstrap_from_openspec
+
+    workspace = Path(args.workspace).resolve()
+    if not workspace.is_dir():
+        print(f"Workspace not found: {workspace}")
+        sys.exit(1)
+
+    db_path = workspace / ".toyshop" / "architecture.db"
+    init_database(db_path)
+
+    openspec_dir = workspace / "openspec"
+    if openspec_dir.is_dir() and (openspec_dir / "design.md").exists():
+        project_id, version = bootstrap_from_openspec(
+            args.name, workspace, openspec_dir,
+            project_type=args.project_type,
+        )
+    else:
+        project_id, version = bootstrap_project(
+            args.name, workspace,
+            project_type=args.project_type,
+        )
+
+    print(f"Project: {project_id}")
+    print(f"Version: v{version.version_number} ({version.change_source})")
+
+
+def cmd_bootstrap_self(args: argparse.Namespace) -> None:
+    """Bootstrap ToyShop itself into the wiki."""
+    from toyshop.self_host import bootstrap_self
+
+    db_path = args.db_path if args.db_path else None
+    project_id = bootstrap_self(db_path=db_path)
+    print(f"ToyShop self-bootstrapped: project_id={project_id}")
+
+
+def cmd_wiki_status(args: argparse.Namespace) -> None:
+    """Show wiki status for a project."""
+    from toyshop.storage.database import init_database, get_project
+    from toyshop.storage.wiki import get_project_summary
+
+    db_path = Path(args.db_path)
+    if not db_path.exists():
+        print(f"Database not found: {db_path}")
+        sys.exit(1)
+
+    init_database(db_path)
+    summary = get_project_summary(args.project)
+
+    if "error" in summary:
+        print(summary["error"])
+        sys.exit(1)
+
+    print(f"Project: {summary['name']} ({summary['project_id']})")
+    print(f"  Path: {summary['root_path']}")
+    print(f"  Type: {summary['project_type']} ({summary['language']})")
+    print(f"  Latest version: v{summary['latest_version']}")
+    if summary.get("git_commit"):
+        print(f"  Git commit: {summary['git_commit'][:8]}")
+    print(f"  Tests: {summary['total_tests']} total, "
+          f"{summary['tests_passed']} passed, {summary['tests_failed']} failed")
+    if summary.get("health_warnings") is not None:
+        print(f"  Health warnings: {summary['health_warnings']}")
+
+
 # --- Helpers ---
 
 def _read_input(input_arg: str) -> str:
@@ -458,6 +573,11 @@ def main() -> None:
         type=int,
         default=8,
         help="Research timebox in minutes for kickoff planning",
+    )
+    p_run_phased.add_argument(
+        "--pause-for-review",
+        action="store_true",
+        help="Pause after research for human review before spec generation",
     )
 
     # create (step 1)
@@ -549,6 +669,36 @@ def main() -> None:
     p_wc.add_argument("--batch", required=True)
     p_wc.add_argument("--message", "-m", default=None)
 
+    # review
+    p_rev = sub.add_parser("review", help="Show current review checkpoint")
+    p_rev.add_argument("--batch", required=True)
+
+    # approve
+    p_app = sub.add_parser("approve", help="Approve review checkpoint")
+    p_app.add_argument("--batch", required=True)
+    p_app.add_argument("--notes", default="", help="Optional reviewer notes")
+
+    # reject
+    p_rej = sub.add_parser("reject", help="Reject review checkpoint with feedback")
+    p_rej.add_argument("--batch", required=True)
+    p_rej.add_argument("--notes", required=True, help="Rejection reason / feedback")
+
+    # bootstrap
+    p_bs = sub.add_parser("bootstrap", help="Bootstrap existing project into wiki")
+    p_bs.add_argument("--workspace", required=True, help="Path to existing project")
+    p_bs.add_argument("--name", required=True, help="Project name")
+    p_bs.add_argument("--type", dest="project_type", default="python",
+                      help="Project type: python, java, java-minecraft, json-minecraft")
+
+    # bootstrap-self
+    p_bss = sub.add_parser("bootstrap-self", help="Bootstrap ToyShop itself into wiki")
+    p_bss.add_argument("--db-path", default=None, help="Custom DB path (default: .toyshop/architecture.db)")
+
+    # wiki-status
+    p_ws = sub.add_parser("wiki-status", help="Show wiki status for a project")
+    p_ws.add_argument("--project", required=True, help="Project ID")
+    p_ws.add_argument("--db-path", required=True, help="Path to architecture.db")
+
     args = parser.parse_args()
     cmd = {
         "run": cmd_run, "run-phased": cmd_run_phased,
@@ -562,6 +712,12 @@ def main() -> None:
         "wiki-history": cmd_wiki_history,
         "wiki-diff": cmd_wiki_diff,
         "wiki-commit": cmd_wiki_commit,
+        "review": cmd_review,
+        "approve": cmd_approve,
+        "reject": cmd_reject,
+        "bootstrap": cmd_bootstrap,
+        "bootstrap-self": cmd_bootstrap_self,
+        "wiki-status": cmd_wiki_status,
     }
     cmd[args.command](args)
 
