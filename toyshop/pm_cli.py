@@ -5,11 +5,23 @@ Usage:
   python3 -m toyshop.pm_cli run --name <project> --input <file_or_text> [--pm-root <dir>]
   python3 -m toyshop.pm_cli run-phased --name <project> --input <file_or_text> [--pm-root <dir>]
 
+  # Full auto with reference sources
+  python3 -m toyshop.pm_cli run-with-refs --name <project> --input <req> --type java-minecraft --ref-config refs.toml --projects-dir mods/
+
   # Step-by-step greenfield
   python3 -m toyshop.pm_cli create --name <project> --input <file_or_text> [--pm-root <dir>]
   python3 -m toyshop.pm_cli spec   --batch <batch_dir>
   python3 -m toyshop.pm_cli tasks  --batch <batch_dir>
   python3 -m toyshop.pm_cli tdd    --batch <batch_dir>
+
+  # Reference-enriched pipeline (step-by-step)
+  python3 -m toyshop.pm_cli create    --name <project> --input <req> --type java-minecraft
+  python3 -m toyshop.pm_cli decompose --batch <batch_dir>
+  python3 -m toyshop.pm_cli ref-scan  --batch <batch_dir> --config refs.toml
+  python3 -m toyshop.pm_cli decide    --batch <batch_dir> --projects-dir mods/
+  python3 -m toyshop.pm_cli enrich    --batch <batch_dir>
+  python3 -m toyshop.pm_cli spec      --batch <batch_dir>
+  python3 -m toyshop.pm_cli tdd       --batch <batch_dir>
 
   # Step-by-step change (brownfield)
   python3 -m toyshop.pm_cli change-create  --name <project> --workspace <dir> --input <change_req> [--pm-root <dir>]
@@ -255,6 +267,81 @@ def cmd_reject(args: argparse.Namespace) -> None:
     print("Re-run research or resume with: python3 -m toyshop.pm_cli resume --batch", args.batch)
 
 
+def cmd_decompose(args: argparse.Namespace) -> None:
+    """Decompose requirement into typed aspects (batch-integrated)."""
+    from toyshop.pm import load_batch, run_decompose
+    from toyshop.llm import create_llm
+
+    batch = load_batch(args.batch)
+    llm = create_llm()
+    context = _read_input(args.context) if args.context else ""
+    result = run_decompose(batch, llm, context=context)
+
+    for a in result.aspects:
+        print(f"  [{a.id}] {a.title} ({a.aspect_type}/{a.category}) — {a.priority}")
+    print("\nNext: python3 -m toyshop.pm_cli ref-scan --batch", args.batch, "--config <refs.toml>")
+
+
+def cmd_ref_scan(args: argparse.Namespace) -> None:
+    """Scan reference sources for each aspect in the decomposition."""
+    from toyshop.pm import load_batch, run_ref_scan
+    from toyshop.llm import create_llm
+
+    batch = load_batch(args.batch)
+    llm = create_llm()
+    config_path = Path(args.config) if args.config else None
+    run_ref_scan(batch, llm, ref_config_path=config_path, max_results=args.max_results)
+
+    print("\nNext: python3 -m toyshop.pm_cli decide --batch", args.batch, "--projects-dir <dir>")
+
+
+def cmd_decide(args: argparse.Namespace) -> None:
+    """Decide whether to create a new project or modify an existing one."""
+    from toyshop.pm import load_batch, run_decide
+    from toyshop.llm import create_llm
+
+    batch = load_batch(args.batch)
+    llm = create_llm()
+    projects_dir = Path(args.projects_dir) if args.projects_dir else None
+    decision = run_decide(batch, llm, projects_dir=projects_dir)
+
+    print(f"\nDecision: {decision.action}")
+    if decision.target:
+        print(f"Target: {decision.target}")
+    print(f"Rationale: {decision.rationale}")
+    print("\nNext: python3 -m toyshop.pm_cli enrich --batch", args.batch)
+
+
+def cmd_enrich(args: argparse.Namespace) -> None:
+    """Build enriched requirement from decomposition + references + decision."""
+    from toyshop.pm import load_batch, run_enrich
+
+    batch = load_batch(args.batch)
+    enriched = run_enrich(batch)
+    print(f"\nEnriched requirement: {len(enriched)} chars")
+    print("Next: python3 -m toyshop.pm_cli spec --batch", args.batch)
+
+
+def cmd_run_with_refs(args: argparse.Namespace) -> None:
+    """Full auto with reference sources: decompose → ref-scan → decide → enrich → spec → tdd."""
+    from toyshop.pm import run_batch_with_refs
+    from toyshop.llm import create_llm
+
+    user_input = _read_input(args.input)
+    llm = create_llm()
+    ref_config = Path(args.ref_config) if args.ref_config else None
+    projects_dir = Path(args.projects_dir) if args.projects_dir else None
+
+    batch = run_batch_with_refs(
+        Path(args.pm_root), args.name, user_input, llm,
+        project_type=args.project_type,
+        ref_config_path=ref_config,
+        projects_dir=projects_dir,
+        max_ref_results=args.max_ref_results,
+    )
+    _print_result(batch)
+
+
 def cmd_change_create(args: argparse.Namespace) -> None:
     """Change step 1: Create change batch from existing workspace."""
     from toyshop.pm import create_change_batch
@@ -447,13 +534,29 @@ def cmd_wiki_commit(args: argparse.Namespace) -> None:
 
 def cmd_bootstrap(args: argparse.Namespace) -> None:
     """Bootstrap an existing project into the wiki."""
-    from toyshop.storage.database import init_database
-    from toyshop.storage.wiki import bootstrap_project, bootstrap_from_openspec
-
     workspace = Path(args.workspace).resolve()
     if not workspace.is_dir():
         print(f"Workspace not found: {workspace}")
         sys.exit(1)
+
+    if getattr(args, "smart", False):
+        from toyshop.smart_bootstrap import smart_bootstrap
+        from toyshop.llm import create_llm
+        llm = create_llm()
+        result = smart_bootstrap(
+            project_name=args.name,
+            workspace=workspace,
+            llm=llm,
+            project_type=args.project_type,
+        )
+        print(f"Project: {result.project_id}")
+        print(f"Version: v{result.version_number}")
+        print(f"Modules: {result.modules_count}, Interfaces: {result.interfaces_count}")
+        print(f"Exploration iterations: {result.exploration_iterations}")
+        return
+
+    from toyshop.storage.database import init_database
+    from toyshop.storage.wiki import bootstrap_project, bootstrap_from_openspec
 
     db_path = workspace / ".toyshop" / "architecture.db"
     init_database(db_path)
@@ -479,8 +582,16 @@ def cmd_bootstrap_self(args: argparse.Namespace) -> None:
     from toyshop.self_host import bootstrap_self
 
     db_path = args.db_path if args.db_path else None
-    project_id = bootstrap_self(db_path=db_path)
-    print(f"ToyShop self-bootstrapped: project_id={project_id}")
+    smart = getattr(args, "smart", False)
+
+    if smart:
+        from toyshop.llm import create_llm
+        llm = create_llm()
+        project_id = bootstrap_self(db_path=db_path, smart=True, llm=llm)
+        print(f"ToyShop smart-bootstrapped: project_id={project_id}")
+    else:
+        project_id = bootstrap_self(db_path=db_path)
+        print(f"ToyShop self-bootstrapped: project_id={project_id}")
 
 
 def cmd_wiki_status(args: argparse.Namespace) -> None:
@@ -600,6 +711,37 @@ def main() -> None:
     p_tdd = sub.add_parser("tdd", help="Step 4: Run TDD pipeline")
     p_tdd.add_argument("--batch", required=True)
 
+    # decompose (ref pipeline step 1)
+    p_decompose = sub.add_parser("decompose", help="Decompose requirement into aspects")
+    p_decompose.add_argument("--batch", required=True)
+    p_decompose.add_argument("--context", default=None, help="Optional context text or file")
+
+    # ref-scan (ref pipeline step 2)
+    p_refscan = sub.add_parser("ref-scan", help="Scan reference sources for aspects")
+    p_refscan.add_argument("--batch", required=True)
+    p_refscan.add_argument("--config", "-c", default=None, help="Reference config TOML")
+    p_refscan.add_argument("--max-results", type=int, default=5)
+
+    # decide (ref pipeline step 3)
+    p_decide = sub.add_parser("decide", help="Decide create vs modify")
+    p_decide.add_argument("--batch", required=True)
+    p_decide.add_argument("--projects-dir", "-p", default=None, help="Directory of existing projects")
+
+    # enrich (ref pipeline step 4)
+    p_enrich = sub.add_parser("enrich", help="Build enriched requirement")
+    p_enrich.add_argument("--batch", required=True)
+
+    # run-with-refs (full auto with references)
+    p_rwr = sub.add_parser("run-with-refs", help="Full auto with reference sources")
+    p_rwr.add_argument("--name", required=True)
+    p_rwr.add_argument("--input", required=True, help="Requirements text or path to .md file")
+    p_rwr.add_argument("--pm-root", default=str(Path.home() / ".toyshop" / "projects"))
+    p_rwr.add_argument("--type", dest="project_type", default="python",
+                        help="Project type: python, java, java-minecraft, json-minecraft")
+    p_rwr.add_argument("--ref-config", default=None, help="Reference config TOML path")
+    p_rwr.add_argument("--projects-dir", default=None, help="Directory of existing projects")
+    p_rwr.add_argument("--max-ref-results", type=int, default=5)
+
     # status
     p_status = sub.add_parser("status", help="Show batch status")
     p_status.add_argument("--batch", required=True)
@@ -689,10 +831,14 @@ def main() -> None:
     p_bs.add_argument("--name", required=True, help="Project name")
     p_bs.add_argument("--type", dest="project_type", default="python",
                       help="Project type: python, java, java-minecraft, json-minecraft")
+    p_bs.add_argument("--smart", action="store_true",
+                      help="Use LLM-driven intelligent bootstrap")
 
     # bootstrap-self
     p_bss = sub.add_parser("bootstrap-self", help="Bootstrap ToyShop itself into wiki")
     p_bss.add_argument("--db-path", default=None, help="Custom DB path (default: .toyshop/architecture.db)")
+    p_bss.add_argument("--smart", action="store_true",
+                       help="Use LLM-driven intelligent bootstrap")
 
     # wiki-status
     p_ws = sub.add_parser("wiki-status", help="Show wiki status for a project")
@@ -706,6 +852,11 @@ def main() -> None:
         "tasks": cmd_tasks, "tdd": cmd_tdd, "status": cmd_status,
         "resume": cmd_resume,
         "research-deadlock": cmd_research_deadlock,
+        "decompose": cmd_decompose,
+        "ref-scan": cmd_ref_scan,
+        "decide": cmd_decide,
+        "enrich": cmd_enrich,
+        "run-with-refs": cmd_run_with_refs,
         "change-create": cmd_change_create,
         "change-analyze": cmd_change_analyze,
         "change-spec": cmd_change_spec,

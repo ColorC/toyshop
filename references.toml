@@ -1,0 +1,32 @@
+# ToyShop Reference Sources
+# Logic references: agent/workflow patterns from open-source AI projects
+
+project_name = "toyshop"
+project_type = "python"
+
+[[sources]]
+id = "codex"
+name = "OpenAI Codex CLI"
+source_type = "logic"
+path = "/home/dministrator/work/other github projects/codex"
+language = "typescript"
+tags = ["protocol", "tool_calling", "mcp", "cli", "agent", "sandbox"]
+description = "CLI agent with tool calling, MCP protocol, and sandboxed execution"
+
+[[sources]]
+id = "evoagentx"
+name = "EvoAgentX"
+source_type = "logic"
+path = "/home/dministrator/work/other github projects/EvoAgentX"
+language = "python"
+tags = ["workflow", "evolution", "agent", "optimization", "benchmark"]
+description = "Evolutionary agent optimization framework"
+
+[[sources]]
+id = "swe-debate"
+name = "SWE-Debate"
+source_type = "logic"
+path = "/home/dministrator/work/other github projects/SWE-Debate"
+language = "python"
+tags = ["debate", "multi_agent", "fault_localization", "patch", "review"]
+description = "Multi-agent debate for software engineering fault localization"

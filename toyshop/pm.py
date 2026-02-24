@@ -1388,6 +1388,234 @@ def run_batch_phased(
     return batch
 
 
+# =============================================================================
+# Reference-enriched pipeline
+# =============================================================================
+
+def run_decompose(
+    batch: BatchState,
+    llm: LLM,
+    *,
+    context: str = "",
+) -> "DecompositionResult":
+    """Decompose the batch requirement into typed aspects."""
+    from toyshop.decomposer import decompose_requirement, decomposition_to_dict
+
+    requirement = (batch.batch_dir / "requirements.md").read_text(encoding="utf-8")
+    result = decompose_requirement(requirement, batch.project_type, llm, context=context)
+
+    _write_json(batch.batch_dir / "decomposition.json", decomposition_to_dict(result))
+    _append_stage_event(
+        batch, stage="decompose", event="done",
+        details={"aspects": len(result.aspects)},
+    )
+    print(f"[PM] Decomposed into {len(result.aspects)} aspects")
+    return result
+
+
+def run_ref_scan(
+    batch: BatchState,
+    llm: LLM,
+    *,
+    ref_config_path: Path | None = None,
+    max_results: int = 5,
+) -> dict[str, list]:
+    """Scan reference sources for each aspect in the decomposition."""
+    from toyshop.decomposer import decomposition_from_dict
+    from toyshop.reference import (
+        load_reference_config, scan_references, scan_result_to_dict,
+    )
+
+    decomp_path = batch.batch_dir / "decomposition.json"
+    if not decomp_path.exists():
+        raise FileNotFoundError("decomposition.json not found — run decompose first")
+
+    decomp = decomposition_from_dict(_read_json(decomp_path))
+
+    # Load reference config
+    config_path = ref_config_path
+    if config_path is None:
+        config_path = batch.batch_dir / "references.toml"
+    config = load_reference_config(config_path)
+
+    # Copy config into batch for reproducibility
+    if config_path != batch.batch_dir / "references.toml" and config_path.exists():
+        import shutil as _shutil
+        _shutil.copy2(config_path, batch.batch_dir / "references.toml")
+
+    reports_dir = batch.batch_dir / "reference_reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    all_reports: dict[str, list] = {}
+    for aspect in decomp.aspects:
+        print(f"  Scanning [{aspect.id}] {aspect.title} ({aspect.aspect_type})...")
+        results = scan_references(
+            aspect.id, aspect.aspect_type, aspect.keywords,
+            config, llm, max_results=max_results,
+        )
+        serialized = [scan_result_to_dict(r) for r in results]
+        (reports_dir / f"{aspect.id}.json").write_text(
+            json.dumps(serialized, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        all_reports[aspect.id] = serialized
+        total_snippets = sum(len(r.snippets) for r in results)
+        print(f"    → {len(results)} sources, {total_snippets} snippets")
+
+    _append_stage_event(
+        batch, stage="ref_scan", event="done",
+        details={"aspects_scanned": len(all_reports)},
+    )
+    print(f"[PM] Reference scan complete: {len(all_reports)} aspects")
+    return all_reports
+
+
+def run_decide(
+    batch: BatchState,
+    llm: LLM,
+    *,
+    projects_dir: Path | None = None,
+) -> "Decision":
+    """Decide whether to create a new project or modify an existing one."""
+    from toyshop.decomposer import decomposition_from_dict
+    from toyshop.decision_engine import (
+        analyze_existing_projects, decide_create_or_modify, decision_to_dict,
+    )
+
+    decomp_path = batch.batch_dir / "decomposition.json"
+    if not decomp_path.exists():
+        raise FileNotFoundError("decomposition.json not found — run decompose first")
+
+    decomp = decomposition_from_dict(_read_json(decomp_path))
+
+    candidates = []
+    if projects_dir and projects_dir.is_dir():
+        candidates = analyze_existing_projects(projects_dir, batch.project_type)
+        print(f"  Found {len(candidates)} existing projects")
+
+    decision = decide_create_or_modify(decomp, candidates, llm)
+
+    _write_json(batch.batch_dir / "decision.json", decision_to_dict(decision))
+    _append_stage_event(
+        batch, stage="decide", event="done",
+        details={"action": decision.action, "target": decision.target},
+    )
+    print(f"[PM] Decision: {decision.action}" +
+          (f" → {decision.target}" if decision.target else ""))
+    return decision
+
+
+def run_enrich(batch: BatchState) -> str:
+    """Build enriched requirement from decomposition + references + decision."""
+    from toyshop.scripts.enrich import build_enriched_requirement
+
+    decomp_path = batch.batch_dir / "decomposition.json"
+    if not decomp_path.exists():
+        raise FileNotFoundError("decomposition.json not found — run decompose first")
+
+    decomp_data = _read_json(decomp_path)
+
+    # Load reference reports
+    ref_reports: dict[str, list[dict]] = {}
+    reports_dir = batch.batch_dir / "reference_reports"
+    if reports_dir.is_dir():
+        for f in reports_dir.glob("*.json"):
+            ref_reports[f.stem] = _read_json(f)
+
+    # Load decision
+    decision_data = None
+    decision_path = batch.batch_dir / "decision.json"
+    if decision_path.is_file():
+        decision_data = _read_json(decision_path)
+
+    enriched = build_enriched_requirement(decomp_data, ref_reports, decision_data)
+    out_path = batch.batch_dir / "enriched_requirement.md"
+    out_path.write_text(enriched, encoding="utf-8")
+
+    _append_stage_event(
+        batch, stage="enrich", event="done",
+        details={"chars": len(enriched)},
+    )
+    print(f"[PM] Enriched requirement: {len(enriched)} chars → {out_path.name}")
+    return enriched
+
+
+def run_batch_with_refs(
+    pm_root: str | Path,
+    project_name: str,
+    user_input: str,
+    llm: LLM | None = None,
+    project_type: str = "python",
+    *,
+    ref_config_path: Path | None = None,
+    projects_dir: Path | None = None,
+    max_ref_results: int = 5,
+) -> BatchState:
+    """Full pipeline with reference sources: decompose → ref-scan → decide → enrich → spec → tdd.
+
+    This is the reference-enriched equivalent of run_batch().
+    """
+    if llm is None:
+        llm = create_llm()
+
+    # Step 1: Create batch
+    batch = create_batch(pm_root, project_name, user_input, project_type=project_type)
+    _append_stage_event(batch, stage="init", event="run_with_refs_start")
+
+    # Step 2: Decompose requirement
+    decomp = run_decompose(batch, llm)
+
+    # Step 3: Scan reference sources
+    if ref_config_path:
+        run_ref_scan(batch, llm, ref_config_path=ref_config_path, max_results=max_ref_results)
+
+    # Step 4: Decide create vs modify
+    decision = run_decide(batch, llm, projects_dir=projects_dir)
+
+    # Step 5: Build enriched requirement
+    enriched = run_enrich(batch)
+
+    # Step 6: If decision is "modify" and target exists, switch to change pipeline
+    if decision.action == "modify" and decision.target_path:
+        workspace_path = Path(decision.target_path)
+        if workspace_path.is_dir():
+            # Re-create as change batch with enriched requirement
+            from toyshop.impact import load_impact as _load_impact
+            change_batch = create_change_batch(
+                pm_root, project_name, workspace_path, enriched,
+                project_type=project_type,
+            )
+            # Copy decomposition + reference artifacts
+            for artifact in ["decomposition.json", "decision.json", "enriched_requirement.md"]:
+                src = batch.batch_dir / artifact
+                if src.exists():
+                    shutil.copy2(src, change_batch.batch_dir / artifact)
+            reports_src = batch.batch_dir / "reference_reports"
+            if reports_src.is_dir():
+                reports_dst = change_batch.batch_dir / "reference_reports"
+                if reports_dst.exists():
+                    shutil.rmtree(reports_dst)
+                shutil.copytree(reports_src, reports_dst)
+
+            # Run change pipeline
+            impact = run_change_analysis(change_batch, llm)
+            change_batch = run_spec_evolution(change_batch, impact, llm)
+            if change_batch.status == "failed":
+                return change_batch
+            prepare_tasks(change_batch)
+            run_batch_tdd(change_batch, llm, mode="modify")
+            return change_batch
+
+    # Step 6b: Create pipeline — use enriched requirement for spec generation
+    batch = run_spec_generation(batch, llm, user_input_override=enriched)
+    if batch.status == "failed":
+        return batch
+
+    prepare_tasks(batch)
+    run_batch_tdd(batch, llm)
+    return batch
+
+
 def load_batch(batch_dir: str | Path) -> BatchState:
     """Load a BatchState from an existing batch directory."""
     batch_dir = Path(batch_dir)
