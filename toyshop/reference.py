@@ -259,8 +259,11 @@ def scan_source_analyzer(
     3. Search analysis results for matching registries/mixins/classes
     4. Extract decompiled source snippets
     """
+    import asyncio
+
     try:
-        from modfactory.mod_repo import ModRepository, Loader
+        from modfactory.mod_repo import ModRepository
+        from modfactory.mod_source import Loader
         from modfactory.analyzer import analyze_sync
     except ImportError:
         logger.warning("modfactory not available, skipping analyzer scan")
@@ -269,20 +272,37 @@ def scan_source_analyzer(
     snippets: list[CodeSnippet] = []
     repo = ModRepository()
 
-    # Search Modrinth for relevant mods
-    query = " ".join(keywords[:3])  # use first 3 keywords as search query
+    # Build a simpler search query from keywords
+    # Extract just the meaningful words (skip camelCase, long phrases)
+    import re as _re
+    search_words = []
+    for kw in keywords[:5]:
+        # Extract alphabetic words from camelCase and spaces
+        words = _re.findall(r'[A-Z]?[a-z]+', kw)
+        for w in words:
+            if len(w) >= 3 and w.lower() not in ("the", "and", "for", "with"):
+                search_words.append(w.lower())
+    # Use just the first 2 unique words for a broader search
+    seen = set()
+    unique_words = []
+    for w in search_words:
+        if w not in seen:
+            seen.add(w)
+            unique_words.append(w)
+    query = " ".join(unique_words[:2]) if unique_words else "minecraft"
+
     try:
-        search_results = repo.search(
+        search_results = asyncio.run(repo.search(
             query, loader=Loader.FABRIC, mc_version="1.21.1", limit=search_limit,
-        )
+        ))
     except Exception as e:
         logger.warning("Modrinth search failed: %s", e)
         return []
 
-    for mod_result in search_results:
+    for mod_info in search_results:
         if len(snippets) >= max_snippets:
             break
-        slug = mod_result.get("slug", mod_result.get("project_id", ""))
+        slug = mod_info.slug  # ModInfo dataclass
         if not slug:
             continue
 
@@ -293,42 +313,93 @@ def scan_source_analyzer(
             logger.warning("Failed to analyze mod %s: %s", slug, e)
             continue
 
-        # Search registries
-        for entry in getattr(analysis, "registries", []):
-            entry_id = getattr(entry, "identifier", "")
-            entry_class = getattr(entry, "class_name", "")
-            if any(kw.lower() in entry_id.lower() or kw.lower() in entry_class.lower()
-                   for kw in keywords):
-                src = _read_decompiled_source(analysis, entry_class)
-                if src:
-                    snippets.append(CodeSnippet(
-                        source_id=f"mod:{slug}",
-                        file_path=f"{entry_class}.java",
-                        start_line=1,
-                        end_line=src.count("\n") + 1,
-                        content=src[:2000],
-                        language="java",
-                    ))
-
-        # Search mixins
-        for mixin in getattr(analysis, "mixins", []):
-            mixin_class = getattr(mixin, "class_name", "")
-            targets = getattr(mixin, "targets", [])
-            target_str = " ".join(targets)
-            if any(kw.lower() in mixin_class.lower() or kw.lower() in target_str.lower()
-                   for kw in keywords):
-                src = _read_decompiled_source(analysis, mixin_class)
-                if src:
-                    snippets.append(CodeSnippet(
-                        source_id=f"mod:{slug}",
-                        file_path=f"{mixin_class}.java (mixin)",
-                        start_line=1,
-                        end_line=src.count("\n") + 1,
-                        content=src[:2000],
-                        language="java",
-                    ))
+        _collect_snippets_from_analysis(analysis, slug, keywords, snippets, max_snippets)
 
     return snippets[:max_snippets]
+
+
+def _collect_snippets_from_analysis(
+    analysis: Any,
+    slug: str,
+    keywords: list[str],
+    snippets: list[CodeSnippet],
+    max_snippets: int,
+) -> None:
+    """Extract matching code snippets from a ModAnalysis."""
+    # Split keywords into individual words for more lenient matching
+    # e.g. "BowItem" -> ["bow", "item"], "custom bow" -> ["custom", "bow"]
+    kw_words: list[str] = []
+    for kw in keywords:
+        # Split on whitespace and camelCase
+        import re as _re
+        words = _re.findall(r'[A-Z]?[a-z]+', kw)
+        kw_words.extend(w.lower() for w in words if len(w) >= 3)
+
+    # Also include original keywords as-is for exact match
+    kw_lower = [kw.lower() for kw in keywords] + kw_words
+
+    def matches(text: str) -> bool:
+        text_lower = text.lower()
+        return any(kw in text_lower for kw in kw_lower if kw)
+
+    # Search registries
+    for entry in getattr(analysis, "registries", []):
+        if len(snippets) >= max_snippets:
+            return
+        entry_id = getattr(entry, "identifier", "")
+        entry_class = getattr(entry, "class_name", "")
+        reg_type = getattr(entry, "registry_type", "")
+        searchable = f"{entry_id} {entry_class} {reg_type}"
+        if matches(searchable):
+            src = _read_decompiled_source(analysis, entry_class)
+            if src:
+                snippets.append(CodeSnippet(
+                    source_id=f"mod:{slug}",
+                    file_path=f"{entry_class}.java",
+                    start_line=1,
+                    end_line=src.count("\n") + 1,
+                    content=src[:2000],
+                    language="java",
+                ))
+
+    # Search mixins
+    for mixin in getattr(analysis, "mixins", []):
+        if len(snippets) >= max_snippets:
+            return
+        mixin_class = getattr(mixin, "mixin_class", "")
+        target_classes = getattr(mixin, "target_classes", [])
+        searchable = f"{mixin_class} {' '.join(target_classes)}"
+        if matches(searchable):
+            src = _read_decompiled_source(analysis, mixin_class)
+            if src:
+                snippets.append(CodeSnippet(
+                    source_id=f"mod:{slug}",
+                    file_path=f"{mixin_class}.java (mixin)",
+                    start_line=1,
+                    end_line=src.count("\n") + 1,
+                    content=src[:2000],
+                    language="java",
+                ))
+
+    # Search classes by superclass/interfaces (useful for finding Entity subclasses etc.)
+    for cls in getattr(analysis, "classes", []):
+        if len(snippets) >= max_snippets:
+            return
+        cls_name = getattr(cls, "name", "")
+        superclass = getattr(cls, "superclass", "") or ""
+        interfaces = getattr(cls, "interfaces", [])
+        searchable = f"{cls_name} {superclass} {' '.join(interfaces)}"
+        if matches(searchable):
+            src = _read_decompiled_source(analysis, cls_name)
+            if src:
+                snippets.append(CodeSnippet(
+                    source_id=f"mod:{slug}",
+                    file_path=f"{cls_name}.java",
+                    start_line=1,
+                    end_line=src.count("\n") + 1,
+                    content=src[:2000],
+                    language="java",
+                ))
 
 
 def _read_decompiled_source(analysis: Any, class_name: str) -> str:

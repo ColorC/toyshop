@@ -71,10 +71,10 @@ def main() -> int:
 
     # Step 3: Reference scan
     print("\n--- Step 3: Scan reference sources ---")
-    ref_config = Path(__file__).parent.parent / "references.toml"
+    # For MC mod requirements, prefer modfactory config (has mechanism sources)
+    ref_config = Path("/home/dministrator/work/modfactory/references.toml")
     if not ref_config.exists():
-        # Try modfactory config
-        ref_config = Path("/home/dministrator/work/modfactory/references.toml")
+        ref_config = Path(__file__).parent.parent / "references.toml"
 
     if ref_config.exists():
         reports = run_ref_scan(batch, llm, ref_config_path=ref_config, max_results=3)

@@ -15,6 +15,8 @@ from toyshop.reference import (
     load_reference_config,
     save_reference_config,
     scan_source_grep,
+    scan_source_analyzer,
+    _collect_snippets_from_analysis,
     score_snippets,
     scan_references,
     scan_result_to_dict,
@@ -303,3 +305,177 @@ class TestSerialization:
         assert restored.relevance_score == 0.85
         assert len(restored.snippets) == 1
         assert restored.snippets[0].content == "code here"
+
+
+# ---------------------------------------------------------------------------
+# TestAnalyzerScanner
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_analysis(tmp_path: Path):
+    """Create a fake ModAnalysis-like object with decompiled sources."""
+    from dataclasses import dataclass, field
+
+    @dataclass(frozen=True)
+    class FakeRegistryEntry:
+        registry_type: str
+        identifier: str
+        class_name: str
+        line_number: int = 0
+
+    @dataclass(frozen=True)
+    class FakeMixinInfo:
+        mixin_class: str
+        target_classes: list = field(default_factory=list)
+        injections: list = field(default_factory=list)
+
+    @dataclass(frozen=True)
+    class FakeClassInfo:
+        name: str
+        superclass: str = ""
+        interfaces: list = field(default_factory=list)
+        methods: list = field(default_factory=list)
+        fields: list = field(default_factory=list)
+
+    # Create decompiled source files
+    source_dir = tmp_path / "sources"
+    source_dir.mkdir(parents=True)
+    item_dir = source_dir / "com" / "example" / "frostbow"
+    item_dir.mkdir(parents=True)
+    (item_dir / "FrostBowItem.java").write_text(
+        "package com.example.frostbow;\n"
+        "public class FrostBowItem extends BowItem {\n"
+        "    public void onUse() { /* frost logic */ }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    mixin_dir = source_dir / "com" / "example" / "frostbow" / "mixin"
+    mixin_dir.mkdir(parents=True)
+    (mixin_dir / "ProjectileMixin.java").write_text(
+        "package com.example.frostbow.mixin;\n"
+        "@Mixin(AbstractArrowEntity.class)\n"
+        "public class ProjectileMixin {\n"
+        "    @Inject(method='onHit')\n"
+        "    void applyFrost() { /* slow effect */ }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    class FakeAnalysis:
+        mod_id = "frost-bow"
+        mod_name = "Frost Bow"
+        registries = [
+            FakeRegistryEntry("ITEM", "frostbow:frost_bow", "com.example.frostbow.FrostBowItem"),
+            FakeRegistryEntry("ENTITY_TYPE", "frostbow:frost_arrow", "com.example.frostbow.FrostArrowEntity"),
+        ]
+        mixins = [
+            FakeMixinInfo(
+                "com.example.frostbow.mixin.ProjectileMixin",
+                target_classes=["net.minecraft.entity.projectile.AbstractArrowEntity"],
+            ),
+        ]
+        classes = [
+            FakeClassInfo(
+                "com.example.frostbow.FrostBowItem",
+                superclass="net.minecraft.item.BowItem",
+                interfaces=["net.minecraft.item.Vanishable"],
+            ),
+        ]
+
+    fake = FakeAnalysis()
+    fake.source_dir = source_dir
+    return fake
+
+
+class TestCollectSnippets:
+    def test_finds_registry_match(self, tmp_path):
+        analysis = _make_fake_analysis(tmp_path)
+        snippets: list[CodeSnippet] = []
+        _collect_snippets_from_analysis(analysis, "frost-bow", ["bow", "item"], snippets, 10)
+        assert len(snippets) >= 1
+        assert any("FrostBowItem" in s.file_path for s in snippets)
+
+    def test_finds_mixin_match(self, tmp_path):
+        analysis = _make_fake_analysis(tmp_path)
+        snippets: list[CodeSnippet] = []
+        _collect_snippets_from_analysis(analysis, "frost-bow", ["projectile", "arrow"], snippets, 10)
+        assert any("mixin" in s.file_path.lower() for s in snippets)
+
+    def test_finds_class_by_superclass(self, tmp_path):
+        analysis = _make_fake_analysis(tmp_path)
+        snippets: list[CodeSnippet] = []
+        _collect_snippets_from_analysis(analysis, "frost-bow", ["BowItem"], snippets, 10)
+        assert len(snippets) >= 1
+
+    def test_respects_max_snippets(self, tmp_path):
+        analysis = _make_fake_analysis(tmp_path)
+        snippets: list[CodeSnippet] = []
+        _collect_snippets_from_analysis(analysis, "frost-bow", ["frost", "bow", "arrow"], snippets, 2)
+        assert len(snippets) <= 2
+
+    def test_no_match_returns_empty(self, tmp_path):
+        analysis = _make_fake_analysis(tmp_path)
+        snippets: list[CodeSnippet] = []
+        _collect_snippets_from_analysis(analysis, "frost-bow", ["zzz_nonexistent"], snippets, 10)
+        assert len(snippets) == 0
+
+
+class TestAnalyzerScanner:
+    def test_scan_with_mocked_modfactory(self, tmp_path):
+        """Full scan_source_analyzer with mocked Modrinth search + analyze_sync."""
+        from dataclasses import dataclass
+        analysis = _make_fake_analysis(tmp_path)
+
+        @dataclass
+        class FakeModInfo:
+            slug: str = "frost-bow"
+            name: str = "Frost Bow"
+
+        async def fake_search(query, loader=None, mc_version=None, limit=10):
+            return [FakeModInfo()]
+
+        source = ReferenceSource(
+            id="modrinth-mods", name="Modrinth", source_type="mechanism",
+            path=".cache/analyzer", language="java",
+            tags=["fabric", "item", "bow"], analyzer="modfactory",
+        )
+
+        # Patch at the module level where the lazy imports resolve
+        mock_repo_cls = MagicMock()
+        mock_repo_cls.return_value.search = fake_search
+
+        mock_mod_repo = MagicMock()
+        mock_mod_repo.ModRepository = mock_repo_cls
+
+        mock_mod_source = MagicMock()
+        mock_mod_source.Loader.FABRIC = "fabric"
+
+        mock_analyzer = MagicMock()
+        mock_analyzer.analyze_sync = MagicMock(return_value=analysis)
+
+        with patch.dict("sys.modules", {
+            "modfactory": MagicMock(),
+            "modfactory.mod_repo": mock_mod_repo,
+            "modfactory.mod_source": mock_mod_source,
+            "modfactory.analyzer": mock_analyzer,
+        }):
+            snippets = scan_source_analyzer(source, ["bow", "frost"])
+
+        assert len(snippets) >= 1
+        assert any("FrostBowItem" in s.content for s in snippets)
+
+    def test_scan_handles_import_error(self):
+        """If modfactory not installed, returns empty."""
+        source = ReferenceSource(
+            id="modrinth-mods", name="Modrinth", source_type="mechanism",
+            path=".cache/analyzer", language="java", analyzer="modfactory",
+        )
+        # Force ImportError by removing modfactory from sys.modules
+        with patch.dict("sys.modules", {
+            "modfactory": None,
+            "modfactory.mod_repo": None,
+            "modfactory.mod_source": None,
+            "modfactory.analyzer": None,
+        }):
+            snippets = scan_source_analyzer(source, ["bow"])
+        assert snippets == []
