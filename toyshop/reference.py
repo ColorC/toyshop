@@ -518,11 +518,12 @@ def scan_references(
 
     Picks sources by type (logic/mechanism), scans, scores, returns top results.
     """
-    # Filter sources by aspect type
+    # Filter sources by aspect type or tag overlap with keywords
+    kw_lower = [kw.lower() for kw in keywords]
     matching_sources = [
         s for s in config.sources
         if s.source_type == aspect_type
-        or any(tag in keywords for tag in s.tags)
+        or any(tag in kw for tag in s.tags for kw in kw_lower)
     ]
     if not matching_sources:
         matching_sources = config.sources  # fallback: search all
