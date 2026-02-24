@@ -39,11 +39,11 @@ _CONFIG_SEARCH_PATHS = [
 # Claude Code proxy — reads from ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN env vars
 _CLAUDE_CODE_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "")
 _CLAUDE_CODE_AUTH_TOKEN = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
-_CLAUDE_CODE_DEFAULT_MODEL = "anthropic/claude-sonnet-4-20250514"
+_CLAUDE_CODE_DEFAULT_MODEL = "anthropic/claude-opus-4-6"
 
 # Legacy ccman local proxy (deprecated — use Claude Code env vars instead)
 _CCMAN_BASE_URL = "http://127.0.0.1:15721"
-_CCMAN_DEFAULT_MODEL = "anthropic/claude-sonnet-4-20250514"
+_CCMAN_DEFAULT_MODEL = "anthropic/claude-opus-4-6"
 
 
 def _ccman_available() -> bool:
@@ -81,7 +81,7 @@ def create_llm(
 ) -> LLM:
     """Create an LLM instance.
 
-    Priority: explicit args > ccman local proxy > openhands config.toml.
+    Priority: explicit args > ANTHROPIC_BASE_URL env (Claude Code proxy) > ccman > config.toml.
     """
     cfg = _read_config_toml()
 
@@ -90,18 +90,24 @@ def create_llm(
         resolved_model = model or cfg.get("model", "openai/gpt-5.3-codex")
         resolved_base_url = base_url or cfg.get("base_url")
         resolved_key = api_key or cfg.get("api_key", "")
-    # 2. ccman proxy (same endpoint as Claude Code)
+    # 2. Claude Code proxy (ANTHROPIC_BASE_URL env var)
+    elif _CLAUDE_CODE_BASE_URL:
+        resolved_model = _CLAUDE_CODE_DEFAULT_MODEL
+        resolved_base_url = _CLAUDE_CODE_BASE_URL
+        resolved_key = _CLAUDE_CODE_AUTH_TOKEN or "PROXY_MANAGED"
+        logger.info("Using Claude Code proxy at %s", resolved_base_url)
+    # 3. Legacy ccman proxy
     elif _ccman_available():
         resolved_model = _CCMAN_DEFAULT_MODEL
         resolved_base_url = _CCMAN_BASE_URL
         resolved_key = "proxy-managed"
         logger.info("Using ccman proxy at %s", _CCMAN_BASE_URL)
-    # 3. config.toml fallback
+    # 4. config.toml fallback
     elif cfg:
         resolved_model = cfg.get("model", "openai/gpt-5.3-codex")
         resolved_base_url = cfg.get("base_url")
         resolved_key = api_key or cfg.get("api_key", "")
-    # 4. Bare fallback
+    # 5. Bare fallback
     else:
         resolved_model = "openai/gpt-5.3-codex"
         resolved_base_url = None
@@ -119,6 +125,7 @@ def create_llm(
         num_retries=5,
         retry_min_wait=3,
         retry_max_wait=30,
+        stream=True,  # Keep connection alive, avoid proxy timeout on long requests
         # Gateway proxies don't support these OpenAI-specific params
         reasoning_effort=None,
         prompt_cache_retention=None,
@@ -250,19 +257,22 @@ def _chat_with_tool_messages(
         api_key=llm.api_key.get_secret_value() if llm.api_key else "proxy-managed",
         base_url=llm.base_url,
         timeout=llm.timeout,
+        max_retries=5,
     )
 
     # Strip "anthropic/" prefix for native client
     model_id = llm.model.removeprefix("anthropic/")
 
-    response = client.messages.create(
+    # Use streaming to match Claude Code's behavior — keeps connection alive
+    # and avoids proxy upstream disconnecting during long non-streaming waits.
+    with client.messages.stream(
         model=model_id,
-        system=system_prompt,
+        system=system_prompt + f"\n\nYou MUST use the `{tool_name}` tool to respond. Do not reply with text.",
         messages=[{"role": "user", "content": user_content}],
         tools=[tool_def],
-        tool_choice={"type": "tool", "name": tool_name},
         max_tokens=4096,
-    )
+    ) as stream:
+        response = stream.get_final_message()
 
     # Extract tool use from response
     for block in response.content:
@@ -323,11 +333,12 @@ def probe_llm(llm: LLM, timeout: int = 15) -> tuple[bool, str]:
                 base_url=llm.base_url,
                 timeout=timeout,
             )
-            client.messages.create(
+            with client.messages.stream(
                 model=llm.model.removeprefix("anthropic/"),
                 messages=[{"role": "user", "content": "ping"}],
                 max_tokens=8,
-            )
+            ) as stream:
+                stream.get_final_message()
             return True, ""
         except Exception as e:
             return False, str(e)

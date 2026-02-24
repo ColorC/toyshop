@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from openhands.sdk import LLM, Agent
-from openhands.sdk.conversation import Conversation
+from openhands.sdk.conversation import Conversation as _Conversation
 from openhands.sdk.tool import (
     ToolAnnotations,
     ToolDefinition,
@@ -98,6 +98,22 @@ import toyshop.debug_hypothesis  # noqa: F401 — registers hypothesis_tool
 if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
     from openhands.sdk.conversation.state import ConversationState
+
+
+def _noop_token_callback(chunk: Any) -> None:
+    """No-op callback to enable streaming in Conversation.
+
+    When LLM.stream=True, the SDK requires an on_token callback.
+    This keeps the HTTP connection alive and avoids proxy timeouts.
+    """
+    pass
+
+
+def Conversation(**kwargs: Any) -> _Conversation:
+    """Create a Conversation with streaming enabled by default."""
+    if "token_callbacks" not in kwargs:
+        kwargs["token_callbacks"] = [_noop_token_callback]
+    return _Conversation(**kwargs)
 
 
 # =============================================================================
@@ -1990,7 +2006,11 @@ def run_tdd_pipeline(
         # Fallback: treat language as project_type ID
         pt = get_project_type("python")
     lang = get_language_support(pt.language)
-    runner = PytestRunner()  # Phase 2: will use get_test_runner(pt.test_framework)
+    try:
+        runner = get_test_runner(pt.test_framework)
+    except KeyError:
+        print(f"  [WARN] No test runner for '{pt.test_framework}', falling back to PytestRunner")
+        runner = PytestRunner()
 
     # ── Phase 1: Signature Extraction ──
     print("[TDD] Phase 1: Signature Extraction")
