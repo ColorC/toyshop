@@ -42,7 +42,7 @@ from openhands.sdk.tool import (
 # Cross-language abstraction layer (Phase 1)
 from toyshop.project_type import get_project_type, ProjectType
 from toyshop.lang.base import get_language_support, LanguageSupport
-from toyshop.test_runner import get_test_runner, TestRunner as _TestRunner, PytestRunner
+from toyshop.test_runner import get_test_runner, TestRunner as _TestRunner, PytestRunner, RconTestRunner
 import toyshop.lang.python_lang  # noqa: F401 — trigger auto-registration
 
 # Import tools to trigger registration
@@ -311,8 +311,10 @@ class TDDResult:
     stub_files: list[str] = field(default_factory=list)
     whitebox_passed: bool = False
     blackbox_passed: bool = False
+    rcon_passed: bool = False
     whitebox_output: str = ""
     blackbox_output: str = ""
+    rcon_output: str = ""
     summary: str = ""
     retry_count: int = 0
     # Debug enhancement fields
@@ -1392,6 +1394,14 @@ TDD_CODE_AGENT_SMOKE_PROMPT = """You are an expert developer. Implement code bas
 - Handle edge cases as you understand them from reading tests and design docs
 - After implementing, run the smoke test command provided in the task message
 
+## Minecraft Mod Rules (if this is a Fabric mod project)
+- This is a **Fabric** mod (NOT Forge). Use Fabric API, ModInitializer, etc.
+- Do NOT modify build.gradle, gradle.properties, settings.gradle, or fabric.mod.json — they are pre-configured
+- Do NOT switch to Forge, NeoForge, or any other mod loader
+- Use `net.fabricmc.*` imports, NOT `net.minecraftforge.*`
+- Target Minecraft 1.21.1 with Java 21
+- Use official Mojang mappings (not Yarn)
+
 When done, call finish with a summary of what was implemented.
 """
 
@@ -2012,6 +2022,14 @@ def run_tdd_pipeline(
         print(f"  [WARN] No test runner for '{pt.test_framework}', falling back to PytestRunner")
         runner = PytestRunner()
 
+    # For java-minecraft: whitebox tests are Python (pytest), RCON is the real MC test
+    # Keep a separate pytest runner for whitebox even when primary runner is RCON
+    wb_runner: _TestRunner = runner
+    rcon_runner: RconTestRunner | None = None
+    if pt.id == "java-minecraft":
+        wb_runner = PytestRunner()
+        rcon_runner = RconTestRunner(manage_server=True)
+
     # ── Phase 1: Signature Extraction ──
     print("[TDD] Phase 1: Signature Extraction")
     manifest = extract_signatures(workspace, mode=mode, lang=lang)
@@ -2028,6 +2046,18 @@ def run_tdd_pipeline(
             stub_files=manifest.stub_files,
             summary="No interfaces found in design.md — cannot generate stubs",
         )
+
+    # ── Phase 1.5: Fabric scaffold (java-minecraft only) ──
+    if pt.id == "java-minecraft":
+        from toyshop.mc_scaffold import scaffold_fabric_mod
+        scaffold_result = scaffold_fabric_mod(
+            workspace,
+            stub_files=manifest.stub_files,
+        )
+        if scaffold_result["files_created"]:
+            print(f"[TDD] Phase 1.5: Fabric scaffold — {scaffold_result['files_created']}")
+        else:
+            print("[TDD] Phase 1.5: Fabric scaffold — already set up")
 
     # ── Phase 2: Test Generation ──
     print("[TDD] Phase 2: Test Generation (Test Agent — write mode)")
@@ -2226,7 +2256,7 @@ def run_tdd_pipeline(
     for ac in workspace.glob("tests/test_anticheat_*.py"):
         ignore_pats.append(str(ac.relative_to(workspace)))
 
-    wb_results = runner.run_tests(workspace, ["tests/"], ignore_pats)
+    wb_results = wb_runner.run_tests(workspace, ["tests/"], ignore_pats)
     whitebox_output = wb_results.output
     print(f"  White-box: {wb_results.passed} passed, {wb_results.failed} failed, {wb_results.errors} errors")
 
@@ -2278,7 +2308,7 @@ def run_tdd_pipeline(
                     break
 
             # Phase 4.7: Anti-cheat for flipped tests
-            after_results = runner.run_tests(workspace, ["tests/"], ignore_pats)
+            after_results = wb_runner.run_tests(workspace, ["tests/"], ignore_pats)
             anticheat_files = _run_anticheat(
                 workspace, llm, baseline_results, after_results,
                 round_num=debug_retry + 1, log_dir=log_dir,
@@ -2286,7 +2316,7 @@ def run_tdd_pipeline(
 
             # Re-run all tests (including anticheat)
             all_ignore = [p for p in ignore_pats if "anticheat" not in p]
-            final_results = runner.run_tests(workspace, ["tests/"], all_ignore)
+            final_results = wb_runner.run_tests(workspace, ["tests/"], all_ignore)
             whitebox_output = final_results.output
             print(f"  After round {debug_retry + 1}: {final_results.passed} passed, {final_results.failed} failed")
 
@@ -2338,7 +2368,7 @@ def run_tdd_pipeline(
 
         if bb_test_file.exists():
             print("[TDD] Phase 5b: Black-box Verification (auto)")
-            bb_results = runner.run_tests(
+            bb_results = wb_runner.run_tests(
                 workspace, ["tests/test_blackbox_auto.py"],
             )
             blackbox_output = bb_results.output
@@ -2369,6 +2399,23 @@ def run_tdd_pipeline(
     elif whitebox_passed:
         blackbox_passed = True  # no spec scenarios = skip
 
+    # ── Phase 6: RCON Server Test (java-minecraft only) ──
+    rcon_passed = False
+    rcon_output = ""
+    if rcon_runner and whitebox_passed:
+        print("[TDD] Phase 6: MC Server Test (build → deploy → start → RCON verify → stop)")
+        rcon_result = rcon_runner.run_tests(workspace, timeout=600)
+        rcon_output = rcon_result.output
+        rcon_passed = rcon_result.all_passed
+        print(f"  RCON: {rcon_result.passed} passed, {rcon_result.failed} failed, {rcon_result.errors} errors")
+        if rcon_result.output:
+            # Print last few lines of output for visibility
+            lines = rcon_result.output.strip().split("\n")
+            for line in lines[-10:]:
+                print(f"    {line}")
+    elif not rcon_runner:
+        rcon_passed = True  # non-MC project, skip
+
     # ── Collect results ──
     files_created = []
     for f in workspace.rglob("*"):
@@ -2381,15 +2428,17 @@ def run_tdd_pipeline(
         str(f.relative_to(workspace)) for f in test_dir.rglob("test_*.py")
     )
 
-    success = whitebox_passed and blackbox_passed
+    success = whitebox_passed and blackbox_passed and rcon_passed
     legacy_count = len(all_legacy_issues)
     debug_form_count = sum(len(fs.forms) for fs in all_debug_form_sets)
     summary_parts = [
         f"TDD pipeline {'PASSED' if success else 'FAILED'}",
         f"White-box: {'PASSED' if whitebox_passed else 'FAILED'}",
         f"Black-box: {'PASSED' if blackbox_passed else 'SKIPPED' if not has_spec_scenarios else 'FAILED'}",
-        f"Debug forms: {debug_form_count}",
     ]
+    if rcon_runner:
+        summary_parts.append(f"RCON: {'PASSED' if rcon_passed else 'FAILED'}")
+    summary_parts.append(f"Debug forms: {debug_form_count}")
     if legacy_count:
         summary_parts.append(f"Legacy issues: {legacy_count}")
 
@@ -2400,8 +2449,10 @@ def run_tdd_pipeline(
         stub_files=manifest.stub_files,
         whitebox_passed=whitebox_passed,
         blackbox_passed=blackbox_passed,
+        rcon_passed=rcon_passed,
         whitebox_output=whitebox_output,
         blackbox_output=blackbox_output,
+        rcon_output=rcon_output,
         summary=" | ".join(summary_parts),
         retry_count=len(all_debug_form_sets),
         legacy_issues=all_legacy_issues,

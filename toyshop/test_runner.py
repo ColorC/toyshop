@@ -388,8 +388,9 @@ class GradleTestRunner(TestRunner):
 class RconTestRunner(TestRunner):
     """RCON-based Minecraft mod verification.
 
-    Wraps modfactory.verify_rcon.RCONVerifier to test block/item registration
-    against a running Minecraft server.
+    Manages the full MC server lifecycle: build → deploy → start → RCON → stop.
+    Uses McTestEnvironment for automatic server management, or connects to an
+    already-running server when manage_server=False.
     """
 
     def __init__(
@@ -397,24 +398,57 @@ class RconTestRunner(TestRunner):
         host: str = "localhost",
         port: int = 25575,
         password: str = "modtest",
+        manage_server: bool = True,
     ):
         self.host = host
         self.port = port
         self.password = password
+        self.manage_server = manage_server
 
     def run_tests(
         self,
         workspace: Path,
         test_dirs: list[str] | None = None,
         ignore_patterns: list[str] | None = None,
-        timeout: int = 120,
+        timeout: int = 600,
     ) -> TestRunResult:
         """Run RCON verification for a mod.
 
-        Expects workspace to contain a mod with metadata we can extract,
-        or test_dirs[0] to be a JSON file with {mod_id, blocks, items}.
-        Falls back to Gradle build if RCON is unavailable.
+        When manage_server=True (default), handles the full lifecycle:
+        build → deploy jar → start MC server → RCON verify → stop server.
+
+        When manage_server=False, connects to an already-running server.
         """
+        if self.manage_server:
+            return self._run_with_server(workspace, timeout)
+        return self._run_rcon_only(workspace, test_dirs, timeout)
+
+    def _run_with_server(self, workspace: Path, timeout: int) -> TestRunResult:
+        """Full lifecycle: build → start server → RCON → stop."""
+        try:
+            from toyshop.mc_test_env import McTestEnvironment
+        except ImportError:
+            return TestRunResult(
+                all_passed=False, total=0, passed=0, failed=0, errors=1,
+                output="mc_test_env module not available",
+            )
+
+        spec = self._load_test_spec(workspace, None)
+        mod_id = spec.get("mod_id", "mymod") if spec else "mymod"
+
+        with McTestEnvironment(
+            workspace,
+            mod_id=mod_id,
+            rcon_port=self.port,
+            rcon_password=self.password,
+            startup_timeout=min(timeout // 3, 180),
+        ) as env:
+            return env.run_full_test()
+
+    def _run_rcon_only(
+        self, workspace: Path, test_dirs: list[str] | None, timeout: int,
+    ) -> TestRunResult:
+        """RCON-only: connect to already-running server."""
         try:
             from modfactory.verify_rcon import RCONVerifier
         except ImportError:
@@ -423,7 +457,6 @@ class RconTestRunner(TestRunner):
                 output="modfactory SDK not installed — cannot run RCON tests",
             )
 
-        # Load test spec from JSON if provided
         spec = self._load_test_spec(workspace, test_dirs)
         if not spec:
             return TestRunResult(

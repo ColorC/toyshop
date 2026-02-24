@@ -654,8 +654,9 @@ class TestRconTestRunner:
         loaded = RconTestRunner._load_test_spec(tmp_path, None)
         assert loaded is None
 
-    def test_run_tests_no_modfactory(self, runner, tmp_path, monkeypatch):
-        """Without modfactory SDK, should return error gracefully."""
+    def test_run_tests_no_modfactory(self, tmp_path, monkeypatch):
+        """Without modfactory SDK, RCON-only mode should return error gracefully."""
+        runner = RconTestRunner(manage_server=False)
         import builtins
         real_import = builtins.__import__
 
@@ -669,10 +670,12 @@ class TestRconTestRunner:
         assert result.errors == 1
         assert "not installed" in result.output
 
-
-# ---------------------------------------------------------------------------
-# TestRunner — VisualTestRunner
-# ---------------------------------------------------------------------------
+    def test_run_tests_managed_no_gradlew(self, tmp_path):
+        """With manage_server=True but no gradlew, should fail on build."""
+        runner = RconTestRunner(manage_server=True)
+        result = runner.run_tests(tmp_path)
+        assert result.all_passed is False
+        assert result.failed >= 1 or result.errors >= 1
 
 from toyshop.test_runner import VisualTestRunner
 

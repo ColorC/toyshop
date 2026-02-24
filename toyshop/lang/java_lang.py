@@ -298,10 +298,12 @@ class JavaLanguageSupport(LanguageSupport):
         """Build a Gradle compile command as smoke test.
 
         For Java, compilation IS the smoke test — if it compiles, stubs are valid.
+        Sets JAVA_HOME to ensure correct JDK is used.
         """
         if not stub_modules:
             return "echo 'no stubs to compile' && echo 'smoke ok'"
-        return "./gradlew compileJava 2>&1 && echo 'smoke ok'"
+        java_home = "/home/dministrator/.local/jdk"
+        return f"JAVA_HOME={java_home} PATH={java_home}/bin:$PATH ./gradlew compileJava 2>&1 && echo 'smoke ok'"
 
     # ------------------------------------------------------------------
     # Test metadata extraction

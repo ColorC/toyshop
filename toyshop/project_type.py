@@ -156,18 +156,18 @@ register_project_type(ProjectType(
 register_project_type(ProjectType(
     id="java-minecraft",
     language="java",
-    display_name="Java Minecraft Mod",
+    display_name="Java Minecraft Mod (Fabric)",
     default_artifacts=ProjectArtifacts(
         src=["src/main/java/", "src/client/java/"],
         test=["src/test/java/"],
     ),
-    build_command="./gradlew build",
-    static_check_command="./gradlew build",
+    build_command="JAVA_HOME=/home/dministrator/.local/jdk PATH=/home/dministrator/.local/jdk/bin:$PATH ./gradlew build",
+    static_check_command="JAVA_HOME=/home/dministrator/.local/jdk PATH=/home/dministrator/.local/jdk/bin:$PATH ./gradlew build",
     test_framework="rcon",
-    test_command="./gradlew build",  # Build is the primary test for mods
+    test_command="JAVA_HOME=/home/dministrator/.local/jdk PATH=/home/dministrator/.local/jdk/bin:$PATH ./gradlew build",
     test_file_pattern="*Test.java",
     source_extensions=[".java", ".json"],
-    language_hint="Java (Fabric Minecraft Mod)",
+    language_hint="Java (Fabric Minecraft Mod for MC 1.21.1 — use Fabric API, NOT Forge)",
 ))
 
 register_project_type(ProjectType(
