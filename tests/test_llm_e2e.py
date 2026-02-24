@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 
 from toyshop import create_llm, run_development_pipeline
+from toyshop.llm import probe_llm
 from toyshop.workflows import run_requirement_workflow, run_architecture_workflow
 
 
@@ -30,19 +31,9 @@ def llm():
         pytest.skip("Set TOYSHOP_RUN_LIVE_E2E=1 to run live E2E tests")
 
     _llm = create_llm()
-    # Quick connectivity check — skip entire test if LLM service is down
-    import litellm
-    try:
-        litellm.responses(
-            model=_llm.model,
-            input=[{"role": "user", "content": "ping"}],
-            api_key=_llm.api_key.get_secret_value() if _llm.api_key else None,
-            api_base=_llm.base_url,
-            timeout=15,
-            num_retries=0,
-        )
-    except Exception as e:
-        pytest.skip(f"LLM service unavailable: {e}")
+    ok, err = probe_llm(_llm, timeout=15)
+    if not ok:
+        pytest.skip(f"LLM service unavailable: {err}")
     return _llm
 
 
@@ -61,25 +52,24 @@ class TestRealLLM:
     @pytest.mark.timeout(120)
     def test_llm_connection(self, llm):
         """Test that LLM can connect and respond."""
-        import litellm
+        from toyshop.llm import chat_with_tool
 
-        response = litellm.responses(
-            model=llm.model,
-            input=[{"role": "user", "content": "Say 'OK' if you can hear me."}],
-            api_key=llm.api_key.get_secret_value() if llm.api_key else None,
-            api_base=llm.base_url,
-            timeout=60,
+        result = chat_with_tool(
+            llm=llm,
+            system_prompt="You are a helpful assistant.",
+            user_content="Say 'OK' if you can hear me.",
+            tool_name="respond",
+            tool_description="Respond to the user",
+            tool_parameters={
+                "type": "object",
+                "properties": {"message": {"type": "string"}},
+                "required": ["message"],
+            },
         )
 
-        assert response.output
-        # Extract text from response output
-        text = ""
-        for item in response.output:
-            if hasattr(item, 'content'):
-                for c in item.content:
-                    if hasattr(c, 'text'):
-                        text += c.text
-        assert len(text) > 0
+        assert result is not None
+        assert "message" in result
+        assert len(result["message"]) > 0
 
     @pytest.mark.timeout(180)
     def test_requirement_workflow_real(self, llm):

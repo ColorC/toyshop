@@ -9,6 +9,12 @@ from toyshop.storage.database import (
     get_project,
     save_architecture_from_design,
     get_latest_snapshot,
+    list_projects,
+    find_project_by_path,
+    save_project_norm,
+    get_project_norms,
+    save_health_check,
+    get_health_history,
 )
 from toyshop.storage.wiki import (
     WikiVersion,
@@ -27,6 +33,8 @@ from toyshop.storage.wiki import (
     log_event,
     get_changelog,
     extract_test_metadata,
+    bootstrap_project,
+    bootstrap_from_openspec,
 )
 
 __all__ = [
@@ -38,6 +46,12 @@ __all__ = [
     "get_project",
     "save_architecture_from_design",
     "get_latest_snapshot",
+    "list_projects",
+    "find_project_by_path",
+    "save_project_norm",
+    "get_project_norms",
+    "save_health_check",
+    "get_health_history",
     # Wiki
     "WikiVersion",
     "WikiTestSuite",
@@ -55,4 +69,6 @@ __all__ = [
     "log_event",
     "get_changelog",
     "extract_test_metadata",
+    "bootstrap_project",
+    "bootstrap_from_openspec",
 ]

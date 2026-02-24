@@ -267,10 +267,12 @@ def generate_questions(llm: LLM, state: RequirementState) -> dict[str, Any]:
     )
 
     if result and "questions" in result:
-        questions = [
-            Clarification(question=q.get("question", ""), reason=q.get("reason", ""))
-            for q in result["questions"]
-        ]
+        questions = []
+        for q in result["questions"]:
+            if isinstance(q, dict):
+                questions.append(Clarification(question=q.get("question", ""), reason=q.get("reason", "")))
+            elif isinstance(q, str):
+                questions.append(Clarification(question=q))
         return {"clarifications": questions, "current_step": "proposal"}
     return {"clarifications": [], "current_step": "proposal"}
 
@@ -320,23 +322,27 @@ proposal 应包含：
     )
 
     if result:
-        # Convert to typed objects
-        capabilities = [
-            Capability(
-                name=c.get("name", ""),
-                description=c.get("description", ""),
-                priority=Priority(c.get("priority", "should")),
-            )
-            for c in result.get("capabilities", [])
-        ]
-        risks = [
-            Risk(
-                description=r.get("description", ""),
-                severity=Severity(r.get("severity", "medium")),
-                mitigation=r.get("mitigation", ""),
-            )
-            for r in result.get("risks", [])
-        ]
+        # Convert to typed objects — handle LLM returning strings instead of objects
+        capabilities = []
+        for c in result.get("capabilities", []):
+            if isinstance(c, dict):
+                capabilities.append(Capability(
+                    name=c.get("name", ""),
+                    description=c.get("description", ""),
+                    priority=Priority(c.get("priority", "should")),
+                ))
+            elif isinstance(c, str):
+                capabilities.append(Capability(name=c, description=c, priority=Priority.SHOULD))
+        risks = []
+        for r in result.get("risks", []):
+            if isinstance(r, dict):
+                risks.append(Risk(
+                    description=r.get("description", ""),
+                    severity=Severity(r.get("severity", "medium")),
+                    mitigation=r.get("mitigation", ""),
+                ))
+            elif isinstance(r, str):
+                risks.append(Risk(description=r, severity=Severity.MEDIUM, mitigation=""))
 
         inp = ProposalInput(
             projectName=result.get("project_name", state.project_name),

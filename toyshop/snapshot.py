@@ -8,6 +8,7 @@ Used by the change pipeline to let LLM understand existing code structure.
 from __future__ import annotations
 
 import ast
+import fnmatch
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
@@ -180,12 +181,28 @@ def scan_python_file(file_path: Path, relative_to: Path | None = None) -> Snapsh
     )
 
 
-def create_snapshot(project_dir: Path, project_name: str) -> CodeSnapshot:
+def _matches_ignore(parts: tuple[str, ...], patterns: list[str]) -> bool:
+    """Check if any path component matches an ignore pattern."""
+    for pat in patterns:
+        pat_clean = pat.rstrip("/")
+        for part in parts:
+            if fnmatch.fnmatch(part, pat_clean):
+                return True
+    return False
+
+
+def create_snapshot(
+    project_dir: Path,
+    project_name: str,
+    *,
+    ignore_patterns: list[str] | None = None,
+) -> CodeSnapshot:
     """Scan all Python files in a directory and create a code snapshot.
 
     Args:
         project_dir: Root directory to scan
         project_name: Name of the project
+        ignore_patterns: Directory/file patterns to skip (fnmatch style)
 
     Returns:
         CodeSnapshot with all modules
@@ -196,6 +213,8 @@ def create_snapshot(project_dir: Path, project_name: str) -> CodeSnapshot:
         rel = py_file.relative_to(project_dir)
         parts = rel.parts
         if any(p.startswith(".") or p == "__pycache__" for p in parts):
+            continue
+        if ignore_patterns and _matches_ignore(parts, ignore_patterns):
             continue
         modules.append(scan_python_file(py_file, relative_to=project_dir))
 

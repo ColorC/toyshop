@@ -7,6 +7,7 @@ dependencies = ["openhands-sdk"]
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
+research = ["gpt-researcher"]
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

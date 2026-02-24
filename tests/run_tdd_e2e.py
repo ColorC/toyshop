@@ -55,20 +55,8 @@ def _is_llm_unavailable_error(exc: Exception) -> bool:
 
 def _probe_llm(llm) -> tuple[bool, str]:
     """Fast LLM availability check to avoid long blocking retries in E2E scripts."""
-    import litellm
-    try:
-        litellm.responses(
-            model=llm.model,
-            input=[{"role": "user", "content": "ping"}],
-            api_key=llm.api_key.get_secret_value() if llm.api_key else None,
-            api_base=llm.base_url,
-            timeout=12,
-            num_retries=0,
-            max_output_tokens=8,
-        )
-        return True, ""
-    except Exception as e:
-        return False, str(e)
+    from toyshop.llm import probe_llm
+    return probe_llm(llm, timeout=12)
 
 
 def _on_timeout(signum, frame):

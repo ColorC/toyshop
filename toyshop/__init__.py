@@ -1,7 +1,7 @@
 """ToyShop - Software factory with OpenSpec contracts and OpenHands LLM."""
 
 # Legacy API (will be deprecated)
-from toyshop.llm import create_llm, chat_with_tool
+from toyshop.llm import create_llm, chat_with_tool, probe_llm
 from toyshop.pipeline import run_development_pipeline, DevelopmentPipelineState
 
 # New Agent-based API
@@ -54,6 +54,7 @@ __all__ = [
     # Legacy
     "create_llm",
     "chat_with_tool",
+    "probe_llm",
     "run_development_pipeline",
     "DevelopmentPipelineState",
     # New Agent API

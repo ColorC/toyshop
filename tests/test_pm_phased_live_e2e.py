@@ -13,10 +13,9 @@ import json
 import os
 from pathlib import Path
 
-import litellm
 import pytest
 
-from toyshop.llm import create_llm
+from toyshop.llm import create_llm, probe_llm
 from toyshop.pm import run_batch_phased
 
 
@@ -39,18 +38,9 @@ def llm():
         pytest.skip("Set TOYSHOP_RUN_PHASED_LIVE_E2E=1 to run phased live E2E test")
 
     _llm = create_llm(timeout=300)
-    try:
-        litellm.responses(
-            model=_llm.model,
-            input=[{"role": "user", "content": "ping"}],
-            api_key=_llm.api_key.get_secret_value() if _llm.api_key else None,
-            api_base=_llm.base_url,
-            timeout=20,
-            num_retries=0,
-            max_output_tokens=8,
-        )
-    except Exception as e:
-        pytest.skip(f"LLM service unavailable: {e}")
+    ok, err = probe_llm(_llm, timeout=20)
+    if not ok:
+        pytest.skip(f"LLM service unavailable: {err}")
     return _llm
 
 

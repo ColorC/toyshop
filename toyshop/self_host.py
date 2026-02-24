@@ -20,19 +20,43 @@ if TYPE_CHECKING:
 _TOYSHOP_ROOT = Path(__file__).resolve().parent.parent
 
 
-def bootstrap_self(db_path: str | Path | None = None) -> str:
+def bootstrap_self(
+    db_path: str | Path | None = None,
+    *,
+    smart: bool = False,
+    llm: "LLM | None" = None,
+) -> str:
     """Bootstrap ToyShop itself into the wiki system.
 
-    1. Initializes DB (at db_path or default .toyshop/architecture.db)
-    2. Calls bootstrap_project() or bootstrap_from_openspec() for ToyShop
-    3. Returns the project_id
+    Args:
+        db_path: Database path (default: .toyshop/architecture.db)
+        smart: Use LLM-driven intelligent bootstrap
+        llm: LLM instance (required if smart=True)
+
+    Returns:
+        The project_id.
 
     Idempotent — safe to call multiple times.
     """
+    workspace = _TOYSHOP_ROOT
+
+    if smart:
+        if llm is None:
+            raise ValueError("smart=True requires an LLM instance")
+        from toyshop.smart_bootstrap import smart_bootstrap
+        result = smart_bootstrap(
+            project_name="toyshop",
+            workspace=workspace,
+            llm=llm,
+            project_type="python",
+            language="python",
+            db_path=Path(db_path) if db_path else None,
+        )
+        return result.project_id
+
+    # Fallback: existing dumb bootstrap
     from toyshop.storage.database import init_database
     from toyshop.storage.wiki import bootstrap_from_openspec, bootstrap_project
-
-    workspace = _TOYSHOP_ROOT
 
     if db_path is None:
         db_path = workspace / ".toyshop" / "architecture.db"

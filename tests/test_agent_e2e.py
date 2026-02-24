@@ -37,16 +37,10 @@ def llm():
         pytest.skip("Set TOYSHOP_RUN_LIVE_E2E=1 to run live E2E tests")
 
     _llm = create_toyshop_llm()
-    # Quick connectivity check — skip entire test if LLM service is down
-    try:
-        from openhands.sdk.llm.message import Message, TextContent
-        _llm.responses(
-            messages=[
-                Message(role="user", content=[TextContent(text="ping")])
-            ],
-        )
-    except Exception as e:
-        pytest.skip(f"LLM service unavailable: {e}")
+    from toyshop.llm import probe_llm
+    ok, err = probe_llm(_llm, timeout=15)
+    if not ok:
+        pytest.skip(f"LLM service unavailable: {err}")
     return _llm
 
 
