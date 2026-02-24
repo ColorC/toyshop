@@ -73,6 +73,19 @@ class BatchState:
     project_type: str = "python"  # "python" | "java" | "java-minecraft" | "json-minecraft"
 
 
+@dataclass
+class ReviewCheckpoint:
+    """Human review checkpoint — pipeline pauses here until approved."""
+
+    checkpoint_id: str
+    checkpoint_type: str  # "research_review" | "mvp_review"
+    batch_id: str
+    artifacts_to_review: list[str]
+    status: str = "pending"  # pending | approved | rejected | skipped
+    reviewer_notes: str = ""
+    created_at: str = ""
+
+
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -320,6 +333,60 @@ def _save_research_artifacts(
         }, ensure_ascii=False) + "\n")
 
 
+# =============================================================================
+# Review checkpoints
+# =============================================================================
+
+def _write_review_checkpoint(
+    batch: BatchState,
+    checkpoint_type: str,
+    artifacts: list[str],
+) -> ReviewCheckpoint:
+    """Write a review checkpoint file. Pipeline pauses here until approved."""
+    import uuid
+    cp = ReviewCheckpoint(
+        checkpoint_id=str(uuid.uuid4())[:8],
+        checkpoint_type=checkpoint_type,
+        batch_id=batch.batch_id,
+        artifacts_to_review=artifacts,
+        status="pending",
+        created_at=_now_iso(),
+    )
+    _write_json(batch.batch_dir / "review_checkpoint.json", asdict(cp))
+    return cp
+
+
+def _check_review_checkpoint(batch: BatchState) -> ReviewCheckpoint | None:
+    """Read the review checkpoint file if it exists."""
+    path = batch.batch_dir / "review_checkpoint.json"
+    if not path.exists():
+        return None
+    data = _read_json(path)
+    return ReviewCheckpoint(**data)
+
+
+def approve_review(batch_dir: Path, reviewer_notes: str = "") -> None:
+    """Mark the review checkpoint as approved (CLI-callable)."""
+    path = Path(batch_dir) / "review_checkpoint.json"
+    if not path.exists():
+        raise FileNotFoundError(f"No review checkpoint at {path}")
+    data = _read_json(path)
+    data["status"] = "approved"
+    data["reviewer_notes"] = reviewer_notes
+    _write_json(path, data)
+
+
+def reject_review(batch_dir: Path, reviewer_notes: str) -> None:
+    """Mark the review checkpoint as rejected with feedback (CLI-callable)."""
+    path = Path(batch_dir) / "review_checkpoint.json"
+    if not path.exists():
+        raise FileNotFoundError(f"No review checkpoint at {path}")
+    data = _read_json(path)
+    data["status"] = "rejected"
+    data["reviewer_notes"] = reviewer_notes
+    _write_json(path, data)
+
+
 def _build_stage_requirement(user_input: str, plan: ResearchPlan, stage: str) -> str:
     """Build stage-targeted requirement text from research plan."""
     if stage == "mvp":
@@ -345,6 +412,64 @@ def _build_stage_requirement(user_input: str, plan: ResearchPlan, stage: str) ->
             f"{tradeoff_lines}\n"
         )
     return user_input.strip()
+
+
+def _build_structured_stage_requirement(
+    user_input: str,
+    spec: "ResearchSpec",
+    stage: str,
+) -> str:
+    """Build anchored, structured stage requirement from ResearchSpec.
+
+    The original requirement always appears first with an explicit
+    "do not deviate" marker, preventing research results from dominating.
+    """
+    from toyshop.research_agent import ResearchSpec  # noqa: F811
+
+    lines = [
+        "## 原始需求（不可偏离）",
+        spec.original_requirement,
+        "",
+    ]
+
+    if stage == "mvp":
+        lines.extend([
+            "## 阶段目标: MVP",
+            "实现最小端到端可验证路径。",
+            "",
+            "## MVP 范围",
+        ])
+        for b in spec.mvp_boundaries:
+            lines.append(f"- {b}")
+        lines.extend(["", "## 验收标准"])
+        for a in spec.acceptance_criteria:
+            lines.append(f"- {a}")
+        lines.extend(["", "## 本阶段范围外（不要实现）"])
+        for d in spec.deferred_to_sota:
+            lines.append(f"- {d}")
+    elif stage == "sota":
+        lines.extend([
+            "## 阶段目标: SOTA",
+            "在 MVP 基础上提升到 SOTA 标准。",
+            "",
+            "## SOTA 标准",
+        ])
+        for c in spec.sota_criteria:
+            lines.append(f"- {c}")
+        lines.extend(["", "## 基线"])
+        lines.append("MVP 已完成，在此基础上增强质量、健壮性和最佳实践。")
+
+    if spec.architecture_constraints:
+        lines.extend(["", "## 架构约束"])
+        for c in spec.architecture_constraints:
+            lines.append(f"- {c}")
+
+    if spec.risk_items:
+        lines.extend(["", "## 风险项"])
+        for r in spec.risk_items:
+            lines.append(f"- {r}")
+
+    return "\n".join(lines)
 
 
 # =============================================================================
@@ -652,6 +777,62 @@ def prepare_tasks(batch: BatchState) -> list[TaskState]:
     return task_states
 
 
+def _try_bind_git_commit(version, workspace: Path) -> None:
+    """Try to detect the current git HEAD and bind it to the wiki version."""
+    import subprocess
+    from toyshop.storage.wiki import bind_git_commit
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(workspace),
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            commit_hash = result.stdout.strip()
+            if commit_hash:
+                bind_git_commit(version.id, commit_hash)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass  # Not a git repo or git not available — skip silently
+
+
+def _try_health_check(
+    version, project_id: str, project_type: str, db_modules: list[dict],
+) -> None:
+    """Run architecture health check and save results if management_level allows."""
+    from toyshop.project_type import get_project_type
+    from toyshop.impact import check_architecture_health
+    from toyshop.storage.database import save_health_check
+
+    try:
+        pt = get_project_type(project_type)
+    except KeyError:
+        pt = None
+
+    if pt and pt.management_level == "minimal":
+        return  # Skip health checks for minimal projects
+
+    if not db_modules:
+        return  # Nothing to check
+
+    # Build a lightweight adapter object for check_architecture_health
+    class _Mod:
+        def __init__(self, d: dict):
+            self.id = d.get("id", "")
+            self.name = d.get("name", "")
+            self.responsibilities = d.get("responsibilities", [])
+            self.dependencies = d.get("dependencies", [])
+
+    class _Design:
+        def __init__(self, modules: list[dict]):
+            self.modules = [_Mod(m) for m in modules]
+            self.interfaces = []  # Interfaces checked separately
+
+    design = _Design(db_modules)
+    warnings = check_architecture_health(design)
+    save_health_check(version.id, project_id, warnings)
+
+
 def _create_wiki_version(
     batch: BatchState, workspace: Path, result: TDDResult, mode: str,
 ) -> None:
@@ -684,6 +865,8 @@ def _create_wiki_version(
 
     # Parse design.md → structured snapshot of modules + interfaces
     snapshot_id = None
+    db_modules: list[dict] = []
+    db_interfaces: list[dict] = []
     design_path = batch.batch_dir / "openspec" / "design.md"
     if design_path.exists():
         design_text = design_path.read_text(encoding="utf-8")
@@ -691,7 +874,6 @@ def _create_wiki_version(
         interfaces = _parse_design_interfaces(design_text)
         # Convert to DB format (add moduleId linkage)
         mod_name_to_id: dict[str, str] = {}
-        db_modules = []
         for m in modules:
             import uuid as _uuid
             mid = str(_uuid.uuid4())[:8]
@@ -703,7 +885,6 @@ def _create_wiki_version(
                 "responsibilities": m.get("responsibilities", []),
                 "dependencies": m.get("dependencies", []),
             })
-        db_interfaces = []
         for iface in interfaces:
             imod = iface.get("module", "")
             module_id = mod_name_to_id.get(imod, "")
@@ -764,6 +945,13 @@ def _create_wiki_version(
         f"v{version.version_number}: {passed} passed, {failed} failed",
         version_id=version.id,
     )
+
+    # Auto-bind git commit if workspace is a git repo
+    _try_bind_git_commit(version, workspace)
+
+    # Architecture health check (respects management_level)
+    _try_health_check(version, project_id, batch.project_type, db_modules if snapshot_id else [])
+
     snap_info = f", snapshot={snapshot_id[:8]}" if snapshot_id else ""
     print(f"  [wiki] Created version {version.version_number} "
           f"({len(test_cases)} tests, {len(test_files)} files{snap_info})")
@@ -895,6 +1083,7 @@ def run_batch_phased(
     auto_continue_sota: bool = True,
     enable_research_agent: bool = True,
     research_timebox_minutes: int = 8,
+    auto_approve_research: bool = True,
 ) -> BatchState:
     """Phased pipeline: research -> MVP -> mvp_uploaded -> SOTA.
 
@@ -902,6 +1091,10 @@ def run_batch_phased(
     - Integrate research agent planning (MVP and SOTA options).
     - Execute MVP first as verifiable intermediate state.
     - Emit mid-report placeholder and continue to SOTA by default.
+
+    Args:
+        auto_approve_research: If False, pipeline pauses after research
+            for human review. Use approve_review()/reject_review() to resume.
     """
     if llm is None:
         llm = create_llm()
@@ -966,6 +1159,15 @@ def run_batch_phased(
             "mvp_extracted_from_sota": bool(active_plan.mvp_extracted_from_sota),
         },
     )
+
+    # --- Human review checkpoint (if not auto-approved) ---
+    if not auto_approve_research:
+        review_artifacts = ["research/summary.md", "research/result.json"]
+        _write_review_checkpoint(batch, "research_review", review_artifacts)
+        _append_stage_event(batch, stage="research", event="awaiting_review")
+        batch.status = "awaiting_review"
+        _save_progress(batch)
+        return batch
 
     def _run_stage_once(stage: str, stage_input: str, mode: str) -> tuple[bool, TDDResult | None, str]:
         nonlocal batch

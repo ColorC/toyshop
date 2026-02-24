@@ -175,6 +175,61 @@ def _detect_cycles(graph: dict[str, list[str]]) -> list[list[str]]:
 
 
 # =============================================================================
+# Norm compliance checking
+# =============================================================================
+
+
+def check_norms_compliance(
+    project_id: str,
+    design: Any = None,
+) -> list[dict[str, Any]]:
+    """Check current architecture against project norms.
+
+    Combines built-in architecture health checks with custom project norms.
+    Returns list of {norm_name, severity, passed, detail} dicts.
+    """
+    from toyshop.storage.database import get_project_norms
+
+    results: list[dict[str, Any]] = []
+
+    # Built-in health checks
+    if design is not None:
+        warnings = check_architecture_health(design)
+        for w in warnings:
+            results.append({
+                "norm_name": "builtin_architecture_health",
+                "severity": "warning",
+                "passed": False,
+                "detail": w,
+            })
+        if not warnings:
+            results.append({
+                "norm_name": "builtin_architecture_health",
+                "severity": "info",
+                "passed": True,
+                "detail": "All built-in checks passed",
+            })
+
+    # Custom project norms
+    norms = get_project_norms(project_id)
+    for norm in norms:
+        rules = norm.get("rules", [])
+        norm_name = norm.get("norm_name", "unknown")
+        severity = norm.get("severity", "warning")
+
+        # For now, custom norms are advisory — they record that the norm
+        # exists and should be checked. Future: implement rule evaluation.
+        results.append({
+            "norm_name": norm_name,
+            "severity": severity,
+            "passed": True,  # Advisory until rule engine is implemented
+            "detail": f"Norm registered: {norm.get('norm_description', '')} ({len(rules)} rules)",
+        })
+
+    return results
+
+
+# =============================================================================
 # LLM Impact Analysis
 # =============================================================================
 

@@ -429,6 +429,48 @@ def get_changelog(
 
 
 # ---------------------------------------------------------------------------
+# Project summaries (multi-repo management)
+# ---------------------------------------------------------------------------
+
+
+def get_project_summary(project_id: str) -> dict:
+    """Get project summary: latest version, test stats, health status."""
+    from toyshop.storage.database import get_project, get_health_history
+
+    project = get_project(project_id)
+    if not project:
+        return {"error": f"Project {project_id} not found"}
+
+    latest = get_latest_version(project_id)
+    test_suite = get_test_suite(latest.id) if latest else None
+    health = get_health_history(project_id, limit=1)
+
+    return {
+        "project_id": project_id,
+        "name": project.get("name", ""),
+        "root_path": project.get("root_path", ""),
+        "project_type": project.get("project_type", "python"),
+        "language": project.get("language", "python"),
+        "latest_version": latest.version_number if latest else 0,
+        "git_commit": latest.git_commit_hash if latest else None,
+        "total_tests": test_suite.total_tests if test_suite else 0,
+        "tests_passed": test_suite.passed if test_suite else 0,
+        "tests_failed": test_suite.failed if test_suite else 0,
+        "health_warnings": health[0]["warning_count"] if health else None,
+    }
+
+
+def list_project_summaries() -> list[dict]:
+    """List all projects with their latest version info."""
+    from toyshop.storage.database import list_projects
+
+    summaries = []
+    for proj in list_projects():
+        summaries.append(get_project_summary(proj["id"]))
+    return summaries
+
+
+# ---------------------------------------------------------------------------
 # Test metadata extraction
 # ---------------------------------------------------------------------------
 
@@ -450,3 +492,207 @@ def extract_test_metadata(
 
     lang = get_language_support(language)
     return lang.extract_test_metadata(workspace)
+
+
+# ---------------------------------------------------------------------------
+# Project bootstrap
+# ---------------------------------------------------------------------------
+
+
+def bootstrap_project(
+    project_name: str,
+    workspace: Path,
+    project_type: str = "python",
+    language: str = "python",
+) -> tuple[str, "WikiVersion"]:
+    """Bootstrap an existing codebase into the wiki system.
+
+    1. Checks if project already exists by path (idempotent)
+    2. Creates project record
+    3. Scans code with snapshot.create_snapshot()
+    4. Converts snapshot to modules/interfaces for DB
+    5. Creates initial wiki version (v1)
+    6. Extracts test metadata and saves test suite
+    7. Returns (project_id, version)
+    """
+    from toyshop.storage.database import (
+        create_project, find_project_by_path,
+        save_architecture_from_design,
+    )
+    from toyshop.snapshot import create_snapshot
+
+    # Idempotent: check if already bootstrapped
+    existing = find_project_by_path(str(workspace))
+    if existing:
+        latest = get_latest_version(existing["id"])
+        if latest:
+            return existing["id"], latest
+
+    # Create project
+    proj = create_project(project_name, str(workspace), project_type, language)
+    project_id = proj["id"]
+
+    # Scan code
+    snapshot = create_snapshot(workspace, project_name)
+
+    # Convert snapshot modules to DB format
+    db_modules = []
+    db_interfaces = []
+    for mod in snapshot.modules:
+        import uuid as _uuid
+        mid = str(_uuid.uuid4())[:8]
+        db_modules.append({
+            "id": mid,
+            "name": mod.name,
+            "filePath": mod.file_path,
+            "responsibilities": [],
+            "dependencies": [],
+        })
+        for cls in mod.classes:
+            db_interfaces.append({
+                "id": str(_uuid.uuid4())[:8],
+                "moduleId": mid,
+                "name": cls.name,
+                "type": "class",
+                "signature": f"class {cls.name}({', '.join(cls.bases)})" if cls.bases else f"class {cls.name}",
+            })
+        for func in mod.functions:
+            db_interfaces.append({
+                "id": str(_uuid.uuid4())[:8],
+                "moduleId": mid,
+                "name": func.name,
+                "type": "function",
+                "signature": func.signature,
+            })
+
+    snapshot_id = None
+    if db_modules or db_interfaces:
+        snap = save_architecture_from_design(
+            project_id, db_modules, db_interfaces, source="bootstrap",
+        )
+        snapshot_id = snap["id"]
+
+    # Create v1
+    version = create_version(
+        project_id=project_id,
+        snapshot_id=snapshot_id,
+        change_type="create",
+        change_summary=f"Bootstrap from existing codebase ({len(snapshot.modules)} modules)",
+        change_source="bootstrap",
+    )
+
+    # Extract and save test metadata
+    test_files, test_cases = extract_test_metadata(workspace, language)
+    if test_files or test_cases:
+        save_test_suite(
+            version_id=version.id,
+            test_files=test_files,
+            test_cases=test_cases,
+            total_tests=len(test_cases),
+            passed=0,
+            failed=0,
+        )
+
+    log_event(
+        project_id, "version_created",
+        f"Bootstrap v1: {len(snapshot.modules)} modules, {len(test_cases)} tests",
+        version_id=version.id,
+    )
+
+    return project_id, version
+
+
+def bootstrap_from_openspec(
+    project_name: str,
+    workspace: Path,
+    openspec_dir: Path,
+    project_type: str = "python",
+    language: str = "python",
+) -> tuple[str, "WikiVersion"]:
+    """Bootstrap with existing openspec docs frozen into the initial version.
+
+    Same as bootstrap_project but also freezes proposal.md, design.md,
+    tasks.md, spec.md from the openspec directory.
+    """
+    from toyshop.storage.database import (
+        create_project, find_project_by_path,
+        save_architecture_from_design,
+    )
+    from toyshop.snapshot import create_snapshot
+    from toyshop.tdd_pipeline import _parse_design_modules, _parse_design_interfaces
+
+    # Idempotent
+    existing = find_project_by_path(str(workspace))
+    if existing:
+        latest = get_latest_version(existing["id"])
+        if latest:
+            return existing["id"], latest
+
+    proj = create_project(project_name, str(workspace), project_type, language)
+    project_id = proj["id"]
+
+    # Parse design.md for structured architecture if available
+    snapshot_id = None
+    design_path = openspec_dir / "design.md"
+    if design_path.exists():
+        design_text = design_path.read_text(encoding="utf-8")
+        modules = _parse_design_modules(design_text)
+        interfaces = _parse_design_interfaces(design_text)
+
+        import uuid as _uuid
+        mod_name_to_id: dict[str, str] = {}
+        db_modules = []
+        for m in modules:
+            mid = str(_uuid.uuid4())[:8]
+            mod_name_to_id[m.get("name", "")] = mid
+            db_modules.append({
+                "id": mid,
+                "name": m.get("name", ""),
+                "filePath": m.get("filePath", ""),
+                "responsibilities": m.get("responsibilities", []),
+                "dependencies": m.get("dependencies", []),
+            })
+        db_interfaces = []
+        for iface in interfaces:
+            imod = iface.get("module", "")
+            module_id = mod_name_to_id.get(imod, "")
+            db_interfaces.append({
+                "id": str(_uuid.uuid4())[:8],
+                "moduleId": module_id,
+                "name": iface.get("name", ""),
+                "type": "class" if iface.get("signature", "").startswith("class ") else "function",
+                "signature": iface.get("signature", ""),
+            })
+        if db_modules or db_interfaces:
+            snap = save_architecture_from_design(
+                project_id, db_modules, db_interfaces, source="bootstrap_openspec",
+            )
+            snapshot_id = snap["id"]
+
+    version = create_version(
+        project_id=project_id,
+        snapshot_id=snapshot_id,
+        change_type="create",
+        change_summary=f"Bootstrap from openspec ({project_name})",
+        change_source="bootstrap",
+        openspec_dir=openspec_dir,
+    )
+
+    test_files, test_cases = extract_test_metadata(workspace, language)
+    if test_files or test_cases:
+        save_test_suite(
+            version_id=version.id,
+            test_files=test_files,
+            test_cases=test_cases,
+            total_tests=len(test_cases),
+            passed=0,
+            failed=0,
+        )
+
+    log_event(
+        project_id, "version_created",
+        f"Bootstrap from openspec v1: {len(test_cases)} tests",
+        version_id=version.id,
+    )
+
+    return project_id, version

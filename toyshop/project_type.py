@@ -80,6 +80,12 @@ class ProjectType:
     # File extensions
     source_extensions: list[str] = field(default_factory=lambda: [".py"])
 
+    # Management level: controls architecture health checks and norm enforcement
+    # "minimal"  — skip health checks (simple config projects)
+    # "standard" — run health checks, norm violations are warnings (default)
+    # "strict"   — run health checks, norm violations are errors that block pipeline
+    management_level: str = "standard"
+
     # Agent prompt hints
     language_hint: str = "Python"
 
@@ -178,5 +184,6 @@ register_project_type(ProjectType(
     test_command="python3 -m pytest tests/ -v",
     test_file_pattern="test_*.py",
     source_extensions=[".json", ".mcmeta"],
+    management_level="minimal",
     language_hint="JSON (Minecraft resource/data pack)",
 ))

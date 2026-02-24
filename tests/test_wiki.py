@@ -300,3 +300,219 @@ class TestChangelog:
                   event_data={"key": "value"})
         entries = get_changelog(project_id)
         assert json.loads(entries[0]["event_data_json"]) == {"key": "value"}
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: Bootstrap, norms, health history
+# ---------------------------------------------------------------------------
+
+from toyshop.storage.wiki import bootstrap_project, bootstrap_from_openspec
+from toyshop.storage.database import (
+    save_project_norm, get_project_norms,
+    save_health_check, get_health_history,
+    find_project_by_path, list_projects,
+)
+
+
+class TestBootstrap:
+    """Tests for bootstrapping existing projects into the wiki."""
+
+    def test_bootstrap_creates_project_and_version(self, wiki_db, tmp_path):
+        # Create a minimal Python project
+        src = tmp_path / "myproject"
+        src.mkdir()
+        (src / "main.py").write_text("def hello():\n    return 'hi'\n")
+        (src / "tests").mkdir()
+        (src / "tests" / "test_main.py").write_text("def test_hello():\n    pass\n")
+
+        project_id, version = bootstrap_project("myproject", src)
+        assert project_id
+        assert version.version_number == 1
+        assert version.change_type == "create"
+        assert version.change_source == "bootstrap"
+
+    def test_bootstrap_extracts_test_metadata(self, wiki_db, tmp_path):
+        src = tmp_path / "proj"
+        src.mkdir()
+        (src / "app.py").write_text("class App:\n    pass\n")
+        (src / "tests").mkdir()
+        (src / "tests" / "test_app.py").write_text(
+            "def test_one():\n    pass\n\ndef test_two():\n    pass\n"
+        )
+
+        project_id, version = bootstrap_project("proj", src)
+        ts = get_test_suite(version.id)
+        assert ts is not None
+        assert ts.total_tests == 2
+
+    def test_bootstrap_idempotent_by_path(self, wiki_db, tmp_path):
+        src = tmp_path / "idempotent"
+        src.mkdir()
+        (src / "main.py").write_text("x = 1\n")
+
+        pid1, v1 = bootstrap_project("proj", src)
+        pid2, v2 = bootstrap_project("proj", src)
+        assert pid1 == pid2
+        assert v1.id == v2.id
+
+    def test_bootstrap_with_openspec(self, wiki_db, tmp_path):
+        src = tmp_path / "specproj"
+        src.mkdir()
+        (src / "main.py").write_text("x = 1\n")
+
+        openspec = tmp_path / "openspec"
+        openspec.mkdir()
+        (openspec / "proposal.md").write_text("# Proposal\nBuild something\n")
+        (openspec / "design.md").write_text("# Design\nSimple design\n")
+
+        project_id, version = bootstrap_from_openspec("specproj", src, openspec)
+        assert version.proposal_md is not None
+        assert "Proposal" in version.proposal_md
+        assert version.design_md is not None
+
+
+class TestProjectNorms:
+    """Tests for project norms CRUD."""
+
+    def test_save_and_get_norms(self, project_id):
+        save_project_norm(project_id, "architecture", "no_circular_deps",
+                          description="No circular dependencies allowed",
+                          rules=["check_cycles"], severity="error")
+        norms = get_project_norms(project_id)
+        assert len(norms) == 1
+        assert norms[0]["norm_name"] == "no_circular_deps"
+        assert norms[0]["severity"] == "error"
+
+    def test_filter_norms_by_type(self, project_id):
+        save_project_norm(project_id, "architecture", "norm_a")
+        save_project_norm(project_id, "testing", "norm_b")
+        save_project_norm(project_id, "architecture", "norm_c")
+
+        arch_norms = get_project_norms(project_id, norm_type="architecture")
+        assert len(arch_norms) == 2
+        test_norms = get_project_norms(project_id, norm_type="testing")
+        assert len(test_norms) == 1
+
+
+class TestHealthHistory:
+    """Tests for architecture health check history."""
+
+    def test_save_and_get_health_check(self, project_id, snapshot_id):
+        version = create_version(project_id, snapshot_id, "create", "v1")
+        save_health_check(version.id, project_id, ["warning 1", "warning 2"])
+
+        history = get_health_history(project_id)
+        assert len(history) == 1
+        assert history[0]["warning_count"] == 2
+        assert "warning 1" in history[0]["warnings"]
+
+    def test_health_history_ordering(self, project_id, snapshot_id):
+        v1 = create_version(project_id, snapshot_id, "create", "v1")
+        save_health_check(v1.id, project_id, ["w1"])
+        v2 = create_version(project_id, snapshot_id, "modify", "v2")
+        save_health_check(v2.id, project_id, [])
+
+        history = get_health_history(project_id)
+        assert len(history) == 2
+        # Newest first
+        assert history[0]["warning_count"] == 0
+        assert history[1]["warning_count"] == 1
+
+
+class TestListProjects:
+    def test_list_projects(self, project_id):
+        projects = list_projects()
+        assert len(projects) >= 1
+        assert any(p["id"] == project_id for p in projects)
+
+
+# ---------------------------------------------------------------------------
+# Stage 5: Multi-repo management, project summaries, norms compliance
+# ---------------------------------------------------------------------------
+
+from toyshop.storage.wiki import get_project_summary, list_project_summaries
+from toyshop.impact import check_norms_compliance
+
+
+class TestProjectSummaries:
+    """Tests for multi-repo project summary views."""
+
+    def test_get_project_summary(self, project_id, snapshot_id):
+        version = create_version(project_id, snapshot_id, "create", "v1")
+        save_test_suite(
+            version.id, ["tests/test_a.py"],
+            [{"id": "t1", "name": "test_a", "file": "tests/test_a.py", "class_name": ""}],
+            1, 1, 0,
+        )
+        summary = get_project_summary(project_id)
+        assert summary["project_id"] == project_id
+        assert summary["latest_version"] == 1
+        assert summary["total_tests"] == 1
+        assert summary["tests_passed"] == 1
+
+    def test_get_project_summary_includes_health(self, project_id, snapshot_id):
+        version = create_version(project_id, snapshot_id, "create", "v1")
+        save_health_check(version.id, project_id, ["warning 1"])
+        summary = get_project_summary(project_id)
+        assert summary["health_warnings"] == 1
+
+    def test_get_project_summary_not_found(self):
+        summary = get_project_summary("nonexistent")
+        assert "error" in summary
+
+    def test_list_project_summaries(self, project_id, snapshot_id):
+        create_version(project_id, snapshot_id, "create", "v1")
+        summaries = list_project_summaries()
+        assert len(summaries) >= 1
+        ids = [s["project_id"] for s in summaries]
+        assert project_id in ids
+
+
+class TestNormsCompliance:
+    """Tests for check_norms_compliance combining built-in + custom norms."""
+
+    def test_compliance_with_healthy_design(self, project_id):
+        from types import SimpleNamespace
+        design = SimpleNamespace(
+            modules=[
+                SimpleNamespace(id="m1", name="core", responsibilities=["compute"],
+                                dependencies=[]),
+            ],
+            interfaces=[
+                SimpleNamespace(name="Calculator", module_id="m1"),
+            ],
+        )
+        results = check_norms_compliance(project_id, design=design)
+        # Should have one passing built-in check
+        builtin = [r for r in results if r["norm_name"] == "builtin_architecture_health"]
+        assert len(builtin) == 1
+        assert builtin[0]["passed"] is True
+
+    def test_compliance_with_custom_norms(self, project_id):
+        save_project_norm(
+            project_id, "architecture", "no_god_objects",
+            description="No module with >5 responsibilities",
+            rules=["max_responsibilities:5"],
+            severity="error",
+        )
+        results = check_norms_compliance(project_id)
+        custom = [r for r in results if r["norm_name"] == "no_god_objects"]
+        assert len(custom) == 1
+        assert custom[0]["severity"] == "error"
+
+    def test_compliance_detects_bloated_module(self, project_id):
+        from types import SimpleNamespace
+        design = SimpleNamespace(
+            modules=[
+                SimpleNamespace(
+                    id="m1", name="god_module",
+                    responsibilities=["a", "b", "c", "d", "e", "f", "g"],
+                    dependencies=[],
+                ),
+            ],
+            interfaces=[],
+        )
+        results = check_norms_compliance(project_id, design=design)
+        failed = [r for r in results if not r["passed"]]
+        assert len(failed) >= 1
+        assert any("职责过多" in r["detail"] for r in failed)

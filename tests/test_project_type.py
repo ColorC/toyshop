@@ -743,3 +743,36 @@ class TestRunnerRegistry:
     def test_unknown_runner_raises(self):
         with pytest.raises(KeyError, match="No test runner"):
             get_test_runner("nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# Stage 5: Management level
+# ---------------------------------------------------------------------------
+
+
+class TestManagementLevel:
+    """Tests for management_level field on ProjectType."""
+
+    def test_default_management_level_is_standard(self):
+        pt = get_project_type("python")
+        assert pt.management_level == "standard"
+
+    def test_java_management_level_is_standard(self):
+        pt = get_project_type("java")
+        assert pt.management_level == "standard"
+
+    def test_json_minecraft_management_level_is_minimal(self):
+        pt = get_project_type("json-minecraft")
+        assert pt.management_level == "minimal"
+
+    def test_custom_strict_management_level(self):
+        strict = ProjectType(
+            id="strict-test",
+            language="python",
+            display_name="Strict Test",
+            default_artifacts=ProjectArtifacts(src=["src/"], test=["tests/"]),
+            management_level="strict",
+        )
+        register_project_type(strict)
+        fetched = get_project_type("strict-test")
+        assert fetched.management_level == "strict"
