@@ -392,6 +392,66 @@ def _load_snapshot_modules_interfaces(
     }
 
 # ---------------------------------------------------------------------------
+# Rollback
+# ---------------------------------------------------------------------------
+
+
+def rollback_to_version(
+    project_id: str,
+    target_version_number: int,
+    reason: str = "manual rollback",
+) -> WikiVersion:
+    """Create a new version that reverts to a previous version's state.
+
+    Does NOT delete history — creates a new version with the old snapshot
+    and copies frozen openspec docs from the target version.
+    """
+    target = get_version_by_number(project_id, target_version_number)
+    if target is None:
+        raise ValueError(
+            f"Version {target_version_number} not found for project {project_id}"
+        )
+
+    # Create new version pointing to the old snapshot
+    new_version = create_version(
+        project_id=project_id,
+        snapshot_id=target.snapshot_id,
+        change_type="rollback",
+        change_summary=f"Rollback to v{target_version_number}: {reason}",
+        change_source="rollback",
+    )
+
+    # Copy frozen openspec docs from target version
+    with transaction() as c:
+        c.execute(
+            """UPDATE wiki_versions
+            SET proposal_md = ?, design_md = ?, tasks_md = ?, spec_md = ?
+            WHERE id = ?""",
+            (target.proposal_md, target.design_md, target.tasks_md,
+             target.spec_md, new_version.id),
+        )
+
+    # Update the returned object to reflect copied docs
+    new_version.proposal_md = target.proposal_md
+    new_version.design_md = target.design_md
+    new_version.tasks_md = target.tasks_md
+    new_version.spec_md = target.spec_md
+
+    log_event(
+        project_id, "wiki_rollback",
+        f"Rolled back to v{target_version_number}: {reason}",
+        version_id=new_version.id,
+        event_data={
+            "target_version": target_version_number,
+            "target_version_id": target.id,
+            "reason": reason,
+        },
+    )
+
+    return new_version
+
+
+# ---------------------------------------------------------------------------
 # Changelog
 # ---------------------------------------------------------------------------
 
@@ -509,7 +569,7 @@ def bootstrap_project(
 
     1. Checks if project already exists by path (idempotent)
     2. Creates project record
-    3. Scans code with snapshot.create_snapshot()
+    3. Scans code with snapshot.create_code_version()
     4. Converts snapshot to modules/interfaces for DB
     5. Creates initial wiki version (v1)
     6. Extracts test metadata and saves test suite
@@ -519,7 +579,7 @@ def bootstrap_project(
         create_project, find_project_by_path,
         save_architecture_from_design,
     )
-    from toyshop.snapshot import create_snapshot
+    from toyshop.snapshot import create_code_version
 
     # Idempotent: check if already bootstrapped
     existing = find_project_by_path(str(workspace))
@@ -533,7 +593,7 @@ def bootstrap_project(
     project_id = proj["id"]
 
     # Scan code
-    snapshot = create_snapshot(workspace, project_name)
+    snapshot = create_code_version(workspace, project_name)
 
     # Convert snapshot modules to DB format
     db_modules = []
@@ -618,8 +678,8 @@ def bootstrap_from_openspec(
         create_project, find_project_by_path,
         save_architecture_from_design,
     )
-    from toyshop.snapshot import create_snapshot
-    from toyshop.tdd_pipeline import _parse_design_modules, _parse_design_interfaces
+    from toyshop.snapshot import create_code_version
+    from toyshop.snapshot import _parse_design_modules, _parse_design_interfaces
 
     # Idempotent
     existing = find_project_by_path(str(workspace))

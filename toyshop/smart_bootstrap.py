@@ -917,7 +917,7 @@ def smart_bootstrap(
     Returns:
         SmartBootstrapResult with project_id, version info, and stats
     """
-    from toyshop.snapshot import create_snapshot
+    from toyshop.snapshot import create_code_version
     from toyshop.storage.database import init_database
     from toyshop.storage.wiki import bootstrap_from_openspec
 
@@ -950,7 +950,7 @@ def smart_bootstrap(
 
     # Phase 2: AST snapshot (ground truth)
     logger.info("Running AST snapshot...")
-    snapshot = create_snapshot(workspace, project_name, ignore_patterns=ignore_patterns)
+    snapshot = create_code_version(workspace, project_name, ignore_patterns=ignore_patterns)
     # Filter out test files from snapshot for architecture docs
     source_modules = [m for m in snapshot.modules if not _is_test_file(m.file_path)]
     logger.info("AST snapshot: %d total modules, %d source modules",
@@ -985,7 +985,7 @@ def smart_bootstrap(
         )
 
         # Count modules/interfaces from the design
-        from toyshop.tdd_pipeline import _parse_design_modules, _parse_design_interfaces
+        from toyshop.snapshot import _parse_design_modules, _parse_design_interfaces
         modules_count = len(_parse_design_modules(design_md))
         interfaces_count = len(_parse_design_interfaces(design_md))
 

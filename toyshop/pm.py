@@ -29,7 +29,7 @@ from toyshop.llm import LLM, create_llm
 from toyshop.workflows.requirement import run_requirement_workflow
 from toyshop.workflows.architecture import run_architecture_workflow
 from toyshop.tdd_pipeline import run_tdd_pipeline, TDDResult
-from toyshop.snapshot import create_snapshot, save_snapshot, CodeSnapshot
+from toyshop.snapshot import create_code_version, save_code_version, CodeVersion
 from toyshop.impact import (
     run_impact_analysis, save_impact, load_impact, ImpactAnalysis,
     check_architecture_health,
@@ -797,11 +797,13 @@ def _try_bind_git_commit(version, workspace: Path) -> None:
 
 
 def _try_health_check(
-    version, project_id: str, project_type: str, db_modules: list[dict],
+    version, project_id: str, project_type: str,
+    db_modules: list[dict], db_interfaces: list[dict] | None = None,
 ) -> None:
-    """Run architecture health check and save results if management_level allows."""
+    """Run architecture health check + guard and save results."""
     from toyshop.project_type import get_project_type
     from toyshop.impact import check_architecture_health
+    from toyshop.architecture_guard import run_architecture_guard
     from toyshop.storage.database import save_health_check
 
     try:
@@ -830,6 +832,25 @@ def _try_health_check(
 
     design = _Design(db_modules)
     warnings = check_architecture_health(design)
+
+    # Run architecture guard checks
+    guard_interfaces = []
+    if db_interfaces:
+        for i in db_interfaces:
+            guard_interfaces.append({
+                "name": i.get("name", ""),
+                "type": i.get("type", "function"),
+                "signature": i.get("signature", ""),
+                "module_id": i.get("moduleId", i.get("module_id", "")),
+            })
+    guard_result = run_architecture_guard(
+        modules=db_modules,
+        interfaces=guard_interfaces,
+        management_level=pt.management_level if pt else "standard",
+    )
+    for v in guard_result.violations:
+        warnings.append(f"[{v.check_name}] {v.detail}")
+
     save_health_check(version.id, project_id, warnings)
 
 
@@ -845,7 +866,7 @@ def _create_wiki_version(
     from toyshop.storage.wiki import (
         create_version, save_test_suite, extract_test_metadata, log_event,
     )
-    from toyshop.tdd_pipeline import _parse_design_modules, _parse_design_interfaces
+    from toyshop.snapshot import _parse_design_modules, _parse_design_interfaces
 
     db_path = workspace / ".toyshop" / "architecture.db"
     init_database(db_path)
@@ -950,11 +971,58 @@ def _create_wiki_version(
     _try_bind_git_commit(version, workspace)
 
     # Architecture health check (respects management_level)
-    _try_health_check(version, project_id, batch.project_type, db_modules if snapshot_id else [])
+    _try_health_check(version, project_id, batch.project_type,
+                      db_modules if snapshot_id else [],
+                      db_interfaces if snapshot_id else None)
 
     snap_info = f", snapshot={snapshot_id[:8]}" if snapshot_id else ""
     print(f"  [wiki] Created version {version.version_number} "
           f"({len(test_cases)} tests, {len(test_files)} files{snap_info})")
+
+
+def _run_pre_tdd_guard(
+    batch: BatchState, workspace: Path,
+) -> "GuardResult | None":
+    """Run architecture guard before TDD. Returns None if skipped."""
+    from toyshop.project_type import get_project_type
+    from toyshop.architecture_guard import run_architecture_guard
+
+    try:
+        pt = get_project_type(batch.project_type)
+    except KeyError:
+        return None
+
+    if pt.management_level == "minimal":
+        return None
+
+    design_path = batch.batch_dir / "openspec" / "design.md"
+    if not design_path.exists():
+        return None
+
+    from toyshop.snapshot import _parse_design_modules, _parse_design_interfaces
+    design_text = design_path.read_text(encoding="utf-8")
+    raw_modules = _parse_design_modules(design_text)
+    raw_interfaces = _parse_design_interfaces(design_text)
+
+    # Convert interfaces to guard format (need module_id)
+    mod_name_to_id: dict[str, str] = {}
+    for m in raw_modules:
+        mod_name_to_id[m.get("name", "")] = m.get("id", m.get("name", ""))
+
+    guard_interfaces = []
+    for i in raw_interfaces:
+        guard_interfaces.append({
+            "name": i.get("name", ""),
+            "type": "class" if i.get("signature", "").startswith("class ") else "function",
+            "signature": i.get("signature", ""),
+            "module_id": mod_name_to_id.get(i.get("module", ""), ""),
+        })
+
+    return run_architecture_guard(
+        modules=raw_modules,
+        interfaces=guard_interfaces,
+        management_level=pt.management_level,
+    )
 
 
 def run_batch_tdd(batch: BatchState, llm: LLM, mode: str = "create") -> TDDResult:
@@ -978,6 +1046,19 @@ def run_batch_tdd(batch: BatchState, llm: LLM, mode: str = "create") -> TDDResul
     # Agent logs at batch level
     log_dir = batch.batch_dir / "agent_logs"
     log_dir.mkdir(exist_ok=True)
+
+    # --- Pre-TDD architecture guard ---
+    guard_result = _run_pre_tdd_guard(batch, workspace)
+    if guard_result and not guard_result.passed:
+        batch.status = "failed"
+        batch.error = f"Architecture guard blocked: {len(guard_result.errors)} violations"
+        _save_progress(batch)
+        for v in guard_result.errors:
+            print(f"  [BLOCK] {v.check_name}: {v.detail}")
+        return TDDResult(success=False, stub_files=[], summary=batch.error)
+    elif guard_result and guard_result.warnings:
+        for v in guard_result.warnings:
+            print(f"  [WARN] {v.check_name}: {v.detail}")
 
     try:
         result = run_tdd_pipeline(
@@ -1751,8 +1832,8 @@ def run_change_analysis(
     openspec_dir = batch.batch_dir / "openspec"
 
     # Phase 1: Code snapshot
-    snapshot = create_snapshot(workspace, batch.project_name)
-    save_snapshot(snapshot, batch.batch_dir / "snapshot.json")
+    snapshot = create_code_version(workspace, batch.project_name)
+    save_code_version(snapshot, batch.batch_dir / "snapshot.json")
     print(f"  Snapshot: {len(snapshot.modules)} modules")
 
     # Read current openspec docs
@@ -1776,7 +1857,7 @@ def run_change_analysis(
 
     # Architecture guard (advisory)
     # Parse design into structured form for health check
-    from toyshop.tdd_pipeline import _parse_design_modules, _parse_design_interfaces
+    from toyshop.snapshot import _parse_design_modules, _parse_design_interfaces
     if design_md:
         from types import SimpleNamespace
         raw_modules = _parse_design_modules(design_md)
@@ -1798,6 +1879,23 @@ def run_change_analysis(
             print(f"  Architecture warnings: {len(arch_warnings)}")
             for w in arch_warnings:
                 print(f"    ⚠ {w}")
+
+        # New module overlap check against existing modules
+        if impact.new_modules:
+            from toyshop.architecture_guard import check_new_module_overlap
+            new_mods = [
+                {"name": n.name, "responsibilities": n.responsibilities}
+                for n in impact.new_modules
+                if hasattr(n, "responsibilities")
+            ]
+            existing_mods = [
+                {"name": m.get("name", ""), "responsibilities": m.get("responsibilities", [])}
+                for m in raw_modules
+            ]
+            overlaps = check_new_module_overlap(new_mods, existing_mods)
+            for v in overlaps:
+                impact.architecture_warnings.append(f"[{v.check_name}] {v.detail}")
+                print(f"    ⚠ {v.detail}")
 
     save_impact(impact, batch.batch_dir / "impact.json")
     _save_progress(batch)

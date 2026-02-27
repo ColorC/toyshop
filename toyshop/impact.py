@@ -15,7 +15,7 @@ from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from toyshop.llm import LLM
-    from toyshop.snapshot import CodeSnapshot
+    from toyshop.snapshot import CodeVersion
 
 
 # =============================================================================
@@ -303,7 +303,7 @@ IMPACT_ANALYSIS_TOOL_SCHEMA = {
 
 def run_impact_analysis(
     change_request: str,
-    snapshot: "CodeSnapshot",
+    snapshot: "CodeVersion",
     design_md: str,
     spec_md: str,
     llm: "LLM",
@@ -321,7 +321,7 @@ def run_impact_analysis(
         ImpactAnalysis with affected modules/interfaces/scenarios
     """
     from toyshop.llm import chat_with_tool
-    from toyshop.snapshot import CodeSnapshot
+    from toyshop.snapshot import CodeVersion
 
     # Build snapshot summary for LLM context
     snap_lines = []
