@@ -27,9 +27,10 @@ from typing import Any
 
 from toyshop.llm import LLM, create_llm
 from toyshop.ports.llm import LLMPort
+from toyshop.ports.coding import CodingAgentPort
 from toyshop.workflows.requirement import run_requirement_workflow
 from toyshop.workflows.architecture import run_architecture_workflow
-from toyshop.tdd_pipeline import run_tdd_pipeline, TDDResult
+from toyshop.tdd_pipeline import TDDResult
 from toyshop.snapshot import create_code_version, save_code_version, CodeVersion
 from toyshop.impact import (
     run_impact_analysis, save_impact, load_impact, ImpactAnalysis,
@@ -1026,11 +1027,17 @@ def _run_pre_tdd_guard(
     )
 
 
-def run_batch_tdd(batch: BatchState, llm: LLMPort, mode: str = "create") -> TDDResult:
+def run_batch_tdd(
+    batch: BatchState,
+    llm: LLMPort,
+    mode: str = "create",
+    coding_agent: CodingAgentPort | None = None,
+) -> TDDResult:
     """Run a single TDD pipeline for the entire batch.
 
     Args:
         mode: "create" for greenfield, "modify" for change pipeline.
+        coding_agent: Optional coding agent adapter (defaults to OpenHandsCodingAdapter).
     """
     print(f"[PM] Running TDD pipeline for batch (mode={mode}, type={batch.project_type})")
     batch.status = "in_progress"
@@ -1061,13 +1068,20 @@ def run_batch_tdd(batch: BatchState, llm: LLMPort, mode: str = "create") -> TDDR
         for v in guard_result.warnings:
             print(f"  [WARN] {v.check_name}: {v.detail}")
 
+    if coding_agent is None:
+        from toyshop.adapters.coding import OpenHandsCodingAdapter
+        coding_agent = OpenHandsCodingAdapter(llm)
+
     try:
-        result = run_tdd_pipeline(
+        result = coding_agent.run_tdd(
             workspace=workspace,
-            llm=llm,
+            design_md=(workspace / "openspec" / "design.md").read_text(encoding="utf-8")
+            if (workspace / "openspec" / "design.md").exists() else "",
+            spec_md=(workspace / "openspec" / "spec.md").read_text(encoding="utf-8")
+            if (workspace / "openspec" / "spec.md").exists() else "",
             mode=mode,
-            log_dir=log_dir,
-            project_type=batch.project_type,
+            language="python",
+            change_request=None,
         )
     except Exception as e:
         batch.status = "failed"
