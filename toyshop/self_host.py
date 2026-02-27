@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from toyshop.pm import BatchState
 
 from toyshop.ports.llm import LLMPort
+from toyshop.ports.storage import StoragePort
+from toyshop.ports.wiki import WikiPort
 
 
 # Default ToyShop root (relative to this file)
@@ -173,6 +175,8 @@ def resync_wiki(
     change_summary: str = "Resync after self-modification",
     change_source: str = "self_modify",
     batch_id: str | None = None,
+    storage: StoragePort | None = None,
+    wiki: WikiPort | None = None,
 ) -> dict[str, Any]:
     """Re-scan ToyShop's codebase and create a new wiki version.
 
@@ -192,24 +196,19 @@ def resync_wiki(
     Returns:
         Dict with version_id, version_number, snapshot_id, drift_warnings.
     """
-    from toyshop.storage.database import (
-        find_project_by_path,
-        save_architecture_from_design,
-    )
-    from toyshop.storage.wiki import (
-        create_version,
-        bind_git_commit,
-        save_test_suite,
-        extract_test_metadata,
-        get_latest_version,
-        log_event,
-    )
     from toyshop.snapshot import create_code_version, bidirectional_drift_check
+
+    if storage is None:
+        from toyshop.adapters.storage import SQLiteStorageAdapter
+        storage = SQLiteStorageAdapter()
+    if wiki is None:
+        from toyshop.adapters.wiki import SQLiteWikiAdapter
+        wiki = SQLiteWikiAdapter()
 
     workspace = _TOYSHOP_ROOT
 
     # 1. Resolve project
-    project = find_project_by_path(str(workspace))
+    project = storage.find_project_by_path(str(workspace))
     if not project:
         return {"success": False, "error": "ToyShop project not found in wiki DB"}
     project_id = project["id"]
@@ -252,18 +251,18 @@ def resync_wiki(
 
     snapshot_id = None
     if db_modules or db_interfaces:
-        snap = save_architecture_from_design(
+        snap = storage.save_architecture(
             project_id, db_modules, db_interfaces, source="resync",
         )
         snapshot_id = snap["id"]
 
     # 4. Create new wiki version
-    latest = get_latest_version(project_id)
+    latest = wiki.get_latest_version(project_id)
     openspec_dir = workspace / "doc"
     if not openspec_dir.is_dir():
         openspec_dir = workspace / "openspec"
 
-    version = create_version(
+    version = wiki.create_version(
         project_id=project_id,
         snapshot_id=snapshot_id,
         change_type="modify",
@@ -275,12 +274,12 @@ def resync_wiki(
 
     # 5. Bind git commit
     if commit_hash:
-        bind_git_commit(version.id, commit_hash)
+        wiki.bind_git_commit(version.id, commit_hash)
 
     # 6. Extract and save test metadata
-    test_files, test_cases = extract_test_metadata(workspace, "python")
+    test_files, test_cases = wiki.extract_test_metadata(workspace, "python")
     if test_files or test_cases:
-        save_test_suite(
+        wiki.save_test_suite(
             version_id=version.id,
             test_files=test_files,
             test_cases=test_cases,
@@ -300,7 +299,7 @@ def resync_wiki(
             drift_warnings.append(f"代码接口 {name} 在 design.md 中未定义")
 
     # 8. Log
-    log_event(
+    wiki.log_event(
         project_id, "wiki_resync",
         f"Resync v{version.version_number}: {len(snapshot.modules)} modules, "
         f"{len(db_interfaces)} interfaces, {len(drift_warnings)} drift warnings",

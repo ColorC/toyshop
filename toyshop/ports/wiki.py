@@ -76,3 +76,22 @@ class WikiPort(Protocol):
     ) -> Any:
         """Save test suite state for a version."""
         ...
+
+    def extract_test_metadata(
+        self,
+        workspace: Any,
+        language: str = "python",
+    ) -> tuple[list[str], list[dict[str, str]]]:
+        """Extract test files and test cases from workspace."""
+        ...
+
+    def log_event(
+        self,
+        project_id: str,
+        event_type: str,
+        event_detail: str,
+        version_id: str | None = None,
+        event_data: dict[str, Any] | None = None,
+    ) -> None:
+        """Append wiki changelog event."""
+        ...
