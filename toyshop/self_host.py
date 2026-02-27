@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     from toyshop.llm import LLM
     from toyshop.pm import BatchState
 
+from toyshop.ports.llm import LLMPort
+
 
 # Default ToyShop root (relative to this file)
 _TOYSHOP_ROOT = Path(__file__).resolve().parent.parent
@@ -104,7 +106,7 @@ def bootstrap_self(
     db_path: str | Path | None = None,
     *,
     smart: bool = False,
-    llm: "LLM | None" = None,
+    llm: "LLMPort | None" = None,
 ) -> str:
     """Bootstrap ToyShop itself into the wiki system.
 
@@ -363,7 +365,7 @@ def record_pipeline_run(
 def generate_self_change_request(
     project_id: str,
     description: str,
-    llm: "LLM | None" = None,
+    llm: "LLMPort | None" = None,
 ) -> dict[str, Any]:
     """Generate a structured change request for ToyShop itself.
 
@@ -519,7 +521,7 @@ def create_self_change_batch(
 
 def run_self_pipeline(
     batch: "BatchState",
-    llm: "LLM",
+    llm: "LLMPort",
 ) -> "BatchState":
     """Run the full brownfield pipeline for a self-change batch.
 

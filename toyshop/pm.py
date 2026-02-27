@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from toyshop.llm import LLM, create_llm
+from toyshop.ports.llm import LLMPort
 from toyshop.workflows.requirement import run_requirement_workflow
 from toyshop.workflows.architecture import run_architecture_workflow
 from toyshop.tdd_pipeline import run_tdd_pipeline, TDDResult
@@ -592,7 +593,7 @@ def parse_tasks_md(text: str) -> list[dict[str, Any]]:
 
 def run_research_planning(
     batch: BatchState,
-    llm: LLM,
+    llm: LLMPort,
     *,
     trigger_type: str = "kickoff_mvp_sota",
     timebox_minutes: int = 8,
@@ -681,7 +682,7 @@ def create_batch(
 
 def run_spec_generation(
     batch: BatchState,
-    llm: LLM,
+    llm: LLMPort,
     *,
     user_input_override: str | None = None,
     stage_name: str | None = None,
@@ -1025,7 +1026,7 @@ def _run_pre_tdd_guard(
     )
 
 
-def run_batch_tdd(batch: BatchState, llm: LLM, mode: str = "create") -> TDDResult:
+def run_batch_tdd(batch: BatchState, llm: LLMPort, mode: str = "create") -> TDDResult:
     """Run a single TDD pipeline for the entire batch.
 
     Args:
@@ -1107,7 +1108,7 @@ def run_batch(
     pm_root: str | Path,
     project_name: str,
     user_input: str,
-    llm: LLM | None = None,
+    llm: LLMPort | None = None,
     project_type: str = "python",
 ) -> BatchState:
     """End-to-end: create batch → generate specs → parse tasks → run TDD pipeline."""
@@ -1158,7 +1159,7 @@ def run_batch_phased(
     pm_root: str | Path,
     project_name: str,
     user_input: str,
-    llm: LLM | None = None,
+    llm: LLMPort | None = None,
     project_type: str = "python",
     *,
     auto_continue_sota: bool = True,
@@ -1475,7 +1476,7 @@ def run_batch_phased(
 
 def run_decompose(
     batch: BatchState,
-    llm: LLM,
+    llm: LLMPort,
     *,
     context: str = "",
 ) -> "DecompositionResult":
@@ -1496,7 +1497,7 @@ def run_decompose(
 
 def run_ref_scan(
     batch: BatchState,
-    llm: LLM,
+    llm: LLMPort,
     *,
     ref_config_path: Path | None = None,
     max_results: int = 5,
@@ -1553,7 +1554,7 @@ def run_ref_scan(
 
 def run_decide(
     batch: BatchState,
-    llm: LLM,
+    llm: LLMPort,
     *,
     projects_dir: Path | None = None,
 ) -> "Decision":
@@ -1625,7 +1626,7 @@ def run_batch_with_refs(
     pm_root: str | Path,
     project_name: str,
     user_input: str,
-    llm: LLM | None = None,
+    llm: LLMPort | None = None,
     project_type: str = "python",
     *,
     ref_config_path: Path | None = None,
@@ -1736,7 +1737,7 @@ def load_batch(batch_dir: str | Path) -> BatchState:
 
 def resume_batch(
     batch_dir: str | Path,
-    llm: LLM | None = None,
+    llm: LLMPort | None = None,
 ) -> BatchState:
     """Resume a batch — re-run TDD if not yet completed."""
     if llm is None:
@@ -1817,7 +1818,7 @@ def create_change_batch(
 
 def run_change_analysis(
     batch: BatchState,
-    llm: LLM,
+    llm: LLMPort,
 ) -> ImpactAnalysis:
     """Phase 1+2: Snapshot code + LLM impact analysis.
 
@@ -1912,7 +1913,7 @@ def run_change_analysis(
 def run_spec_evolution(
     batch: BatchState,
     impact: ImpactAnalysis,
-    llm: LLM,
+    llm: LLMPort,
 ) -> BatchState:
     """Phase 3: Update openspec docs based on impact analysis.
 
