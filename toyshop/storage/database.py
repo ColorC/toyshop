@@ -417,6 +417,40 @@ def find_project_by_path(root_path: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def delete_project(project_id: str) -> None:
+    """Cascade-delete a project and all related data."""
+    with transaction() as cur:
+        # Collect module IDs for interface cleanup
+        mod_ids = [
+            r[0] for r in cur.execute(
+                "SELECT id FROM modules WHERE project_id = ?", (project_id,)
+            ).fetchall()
+        ]
+        if mod_ids:
+            placeholders = ",".join("?" * len(mod_ids))
+            cur.execute(f"DELETE FROM interfaces WHERE module_id IN ({placeholders})", mod_ids)
+        cur.execute("DELETE FROM modules WHERE project_id = ?", (project_id,))
+
+        # Wiki-related tables
+        ver_ids = [
+            r[0] for r in cur.execute(
+                "SELECT id FROM wiki_versions WHERE project_id = ?", (project_id,)
+            ).fetchall()
+        ]
+        if ver_ids:
+            vp = ",".join("?" * len(ver_ids))
+            cur.execute(f"DELETE FROM wiki_test_suites WHERE version_id IN ({vp})", ver_ids)
+            cur.execute(f"DELETE FROM architecture_health_history WHERE version_id IN ({vp})", ver_ids)
+        cur.execute("DELETE FROM wiki_versions WHERE project_id = ?", (project_id,))
+        cur.execute("DELETE FROM wiki_changelog WHERE project_id = ?", (project_id,))
+        cur.execute("DELETE FROM snapshots WHERE project_id = ?", (project_id,))
+        cur.execute("DELETE FROM project_norms WHERE project_id = ?", (project_id,))
+        cur.execute("DELETE FROM run_events WHERE project_id = ?", (project_id,))
+        cur.execute("DELETE FROM workflow_runs WHERE project_id = ?", (project_id,))
+        cur.execute("DELETE FROM change_plans WHERE project_id = ?", (project_id,))
+        cur.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
+
 # ---------------------------------------------------------------------------
 # Project norms
 # ---------------------------------------------------------------------------

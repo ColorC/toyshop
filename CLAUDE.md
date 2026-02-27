@@ -39,3 +39,22 @@ python3 -m toyshop.pm_cli status --batch <dir>
 - 生成的代码是独立项目，review 通过后再集成回 toyshop
 - 这不是真正的自举（没有修改自身代码），但改动的代码最终会应用到自身体系
 - 效率和质量并进：OpenHands 负责量产，Claude 负责质控
+
+### 自举工作流 (Self-Modify)
+
+ToyShop 可以通过自身的 brownfield 管线修改自己的代码：
+
+```bash
+# Step 1: 创建自修改 batch + 跑 brownfield 管线
+python3 -m toyshop.pm_cli self-change --input "变更描述"
+# ← 审查 openspec + 生成代码
+
+# Step 2: 应用到 staging 副本 + 运行自测
+python3 -m toyshop.pm_cli self-apply --batch <batch_dir>
+# ← 审查 diff + 测试结果
+
+# Step 3: 提交审批通过的变更
+python3 -m toyshop.pm_cli self-commit --batch <batch_dir> -m "commit message"
+```
+
+安全机制：staging 隔离（不直接改源码）、双重测试门禁、git checkpoint + 自动回滚。

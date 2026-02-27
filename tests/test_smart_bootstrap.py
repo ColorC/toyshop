@@ -188,18 +188,18 @@ class TestToyignore:
         assert "main.py" in result
 
     def test_snapshot_respects_ignore_patterns(self, tmp_path):
-        from toyshop.snapshot import create_snapshot
+        from toyshop.snapshot import create_code_version
         proj = _make_project(tmp_path)
         # Add a file in an ignored directory
         ignored = proj / "vendor"
         ignored.mkdir()
         (ignored / "lib.py").write_text("def vendored(): pass")
         # Without ignore
-        snap1 = create_snapshot(proj, "test")
+        snap1 = create_code_version(proj, "test")
         names1 = {m.name for m in snap1.modules}
         assert "lib" in names1
         # With ignore
-        snap2 = create_snapshot(proj, "test", ignore_patterns=["vendor/"])
+        snap2 = create_code_version(proj, "test", ignore_patterns=["vendor/"])
         names2 = {m.name for m in snap2.modules}
         assert "lib" not in names2
 

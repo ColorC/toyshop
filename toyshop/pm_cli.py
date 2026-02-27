@@ -29,6 +29,11 @@ Usage:
   python3 -m toyshop.pm_cli change-spec    --batch <batch_dir>
   python3 -m toyshop.pm_cli tdd            --batch <batch_dir>   # auto-detects mode
 
+  # Self-modification (true self-bootstrap)
+  python3 -m toyshop.pm_cli self-change --input <change_request>
+  python3 -m toyshop.pm_cli self-apply  --batch <batch_dir>
+  python3 -m toyshop.pm_cli self-commit --batch <batch_dir> [-m <message>]
+
   # Utilities
   python3 -m toyshop.pm_cli status --batch <batch_dir>
   python3 -m toyshop.pm_cli resume --batch <batch_dir>
@@ -579,10 +584,21 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
 
 def cmd_bootstrap_self(args: argparse.Namespace) -> None:
     """Bootstrap ToyShop itself into the wiki."""
-    from toyshop.self_host import bootstrap_self
+    from toyshop.self_host import bootstrap_self, _TOYSHOP_ROOT
+    from toyshop.storage.database import init_database, find_project_by_path, delete_project
 
     db_path = args.db_path if args.db_path else None
     smart = getattr(args, "smart", False)
+    force = getattr(args, "force", False)
+
+    if force:
+        real_db = Path(db_path) if db_path else (_TOYSHOP_ROOT / ".toyshop" / "architecture.db")
+        if real_db.exists():
+            init_database(real_db)
+            existing = find_project_by_path(str(_TOYSHOP_ROOT))
+            if existing:
+                delete_project(existing["id"])
+                print(f"Deleted existing project {existing['id'][:8]}, re-bootstrapping...")
 
     if smart:
         from toyshop.llm import create_llm
@@ -621,6 +637,117 @@ def cmd_wiki_status(args: argparse.Namespace) -> None:
           f"{summary['tests_passed']} passed, {summary['tests_failed']} failed")
     if summary.get("health_warnings") is not None:
         print(f"  Health warnings: {summary['health_warnings']}")
+
+
+# ---------------------------------------------------------------------------
+# Self-modification commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_self_change(args: argparse.Namespace) -> None:
+    """Self-modify step 1: Create a self-modification batch + run pipeline."""
+    from toyshop.self_host import create_self_change_batch, run_self_pipeline
+    from toyshop.llm import create_llm
+
+    change_request = _read_input(args.input)
+    batch = create_self_change_batch(change_request, pm_root=args.pm_root)
+    print(f"Batch dir: {batch.batch_dir}")
+
+    if not args.no_pipeline:
+        llm = create_llm()
+        batch = run_self_pipeline(batch, llm)
+        if batch.status == "completed":
+            print("\nPipeline completed. Review workspace, then:")
+            print(f"  python3 -m toyshop.pm_cli self-apply --batch {batch.batch_dir}")
+        else:
+            print(f"\nPipeline {batch.status}: {batch.error}")
+    else:
+        print("Next (manual steps):")
+        print(f"  python3 -m toyshop.pm_cli change-analyze --batch {batch.batch_dir}")
+
+
+def cmd_self_apply(args: argparse.Namespace) -> None:
+    """Self-modify step 2: Apply changes to staging + run self-tests."""
+    from toyshop.self_host import apply_self_changes
+    from toyshop.pm import load_batch
+
+    batch = load_batch(args.batch)
+    result = apply_self_changes(batch)
+
+    print(f"\nStaging: {result.staging_dir}")
+    print(f"Changed files: {len(result.changed_files)}")
+    for f in result.changed_files:
+        print(f"  {f}")
+    print(f"\nTests: {result.test_passed}/{result.test_total} passed, "
+          f"{result.test_failed} failed")
+
+    if result.success:
+        print("\nAll tests pass. Review the diff, then:")
+        print(f"  python3 -m toyshop.pm_cli self-commit --batch {args.batch}")
+    else:
+        print(f"\nSelf-tests FAILED. Changes NOT applied.")
+        if result.error:
+            print(f"Error: {result.error}")
+
+
+def cmd_self_commit(args: argparse.Namespace) -> None:
+    """Self-modify step 3: Commit approved changes to ToyShop's repo."""
+    from toyshop.self_host import commit_self_changes, SelfApplyResult
+    from toyshop.pm import load_batch
+
+    batch = load_batch(args.batch)
+
+    result_path = Path(args.batch) / "self_apply_result.json"
+    if not result_path.exists():
+        print("No self_apply_result.json found. Run self-apply first.")
+        sys.exit(1)
+
+    data = json.loads(result_path.read_text(encoding="utf-8"))
+    apply_result = SelfApplyResult.from_json(data)
+
+    commit_result = commit_self_changes(batch, apply_result, commit_message=args.message)
+
+    if commit_result.get("success"):
+        print(f"Committed: {commit_result['commit_hash'][:8]}")
+        print(f"Tests: {commit_result['test_passed']} passed")
+        resync = commit_result.get("wiki_resync", {})
+        if resync.get("success"):
+            print(f"Wiki: resynced → v{resync['version_number']} "
+                  f"({resync['modules']} modules, {resync['interfaces']} interfaces)")
+    else:
+        print(f"Commit FAILED: {commit_result.get('error')}")
+        print("Changes rolled back.")
+
+
+def cmd_wiki_resync(args: argparse.Namespace) -> None:
+    """Manually resync the wiki with ToyShop's current source code."""
+    from toyshop.storage.database import init_database
+    from toyshop.self_host import resync_wiki
+
+    db_path = args.db_path
+    if db_path is None:
+        from toyshop.self_host import _TOYSHOP_ROOT
+        db_path = str(_TOYSHOP_ROOT / ".toyshop" / "architecture.db")
+    init_database(db_path)
+
+    result = resync_wiki(
+        commit_hash=args.commit,
+        change_summary=args.summary or "Manual wiki resync",
+        change_source="manual",
+    )
+
+    if result.get("success"):
+        print(f"Wiki resync OK → v{result['version_number']}")
+        print(f"  Modules: {result['modules']}, Interfaces: {result['interfaces']}")
+        print(f"  Tests: {result['test_files']} files, {result['test_cases']} cases")
+        warnings = result.get("drift_warnings", [])
+        if warnings:
+            print(f"  Drift warnings ({len(warnings)}):")
+            for w in warnings[:10]:
+                print(f"    - {w}")
+    else:
+        print(f"Resync FAILED: {result.get('error')}")
+        sys.exit(1)
 
 
 # --- Helpers ---
@@ -839,6 +966,30 @@ def main() -> None:
     p_bss.add_argument("--db-path", default=None, help="Custom DB path (default: .toyshop/architecture.db)")
     p_bss.add_argument("--smart", action="store_true",
                        help="Use LLM-driven intelligent bootstrap")
+    p_bss.add_argument("--force", action="store_true",
+                       help="Delete existing project data before re-bootstrapping")
+
+    # self-change
+    p_sc = sub.add_parser("self-change", help="Self-modify step 1: Create batch + run pipeline")
+    p_sc.add_argument("--input", required=True, help="Change request text or path to .md file")
+    p_sc.add_argument("--pm-root", default=str(Path.home() / ".toyshop" / "self_changes"))
+    p_sc.add_argument("--no-pipeline", action="store_true",
+                      help="Only create batch, don't run pipeline")
+
+    # self-apply
+    p_sa = sub.add_parser("self-apply", help="Self-modify step 2: Apply to staging + run self-tests")
+    p_sa.add_argument("--batch", required=True)
+
+    # self-commit
+    p_sco = sub.add_parser("self-commit", help="Self-modify step 3: Commit approved changes")
+    p_sco.add_argument("--batch", required=True)
+    p_sco.add_argument("--message", "-m", default=None, help="Custom commit message")
+
+    # wiki-resync
+    p_wr = sub.add_parser("wiki-resync", help="Resync wiki with current source code")
+    p_wr.add_argument("--db-path", default=None, help="Path to architecture.db")
+    p_wr.add_argument("--commit", default=None, help="Git commit hash to bind")
+    p_wr.add_argument("--summary", default=None, help="Change summary text")
 
     # wiki-status
     p_ws = sub.add_parser("wiki-status", help="Show wiki status for a project")
@@ -869,6 +1020,10 @@ def main() -> None:
         "bootstrap": cmd_bootstrap,
         "bootstrap-self": cmd_bootstrap_self,
         "wiki-status": cmd_wiki_status,
+        "self-change": cmd_self_change,
+        "self-apply": cmd_self_apply,
+        "self-commit": cmd_self_commit,
+        "wiki-resync": cmd_wiki_resync,
     }
     cmd[args.command](args)
 
