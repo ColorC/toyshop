@@ -28,6 +28,8 @@ from typing import Any
 from toyshop.llm import LLM, create_llm
 from toyshop.ports.llm import LLMPort
 from toyshop.ports.coding import CodingAgentPort
+from toyshop.ports.spec import SpecPort
+from toyshop.ports.version import CodeVersionPort
 from toyshop.workflows.requirement import run_requirement_workflow
 from toyshop.workflows.architecture import run_architecture_workflow
 from toyshop.tdd_pipeline import TDDResult
@@ -687,6 +689,7 @@ def run_spec_generation(
     *,
     user_input_override: str | None = None,
     stage_name: str | None = None,
+    spec_port: SpecPort | None = None,
 ) -> BatchState:
     """Run requirement + architecture workflows, save openspec docs."""
     print("[PM] Running spec generation (requirement → architecture)")
@@ -696,6 +699,10 @@ def run_spec_generation(
     openspec_dir = batch.batch_dir / "openspec"
     openspec_dir.mkdir(exist_ok=True)
     user_input_text = user_input_override or (batch.batch_dir / "requirements.md").read_text(encoding="utf-8")
+
+    if spec_port is None:
+        from toyshop.adapters.spec import OpenSpecAdapter
+        spec_port = OpenSpecAdapter()
 
     # Requirement workflow
     req_state = run_requirement_workflow(
@@ -714,6 +721,7 @@ def run_spec_generation(
         print(f"  Saved proposal.md")
 
     # Architecture workflow
+    # Keep existing workflow path for backward compatibility; SpecPort reserved for migration hooks
     arch_state = run_architecture_workflow(llm=llm, proposal=req_state.proposal)
     if arch_state.error or arch_state.current_step != "done":
         batch.status = "failed"
@@ -1833,6 +1841,7 @@ def create_change_batch(
 def run_change_analysis(
     batch: BatchState,
     llm: LLMPort,
+    version_port: CodeVersionPort | None = None,
 ) -> ImpactAnalysis:
     """Phase 1+2: Snapshot code + LLM impact analysis.
 
@@ -1846,8 +1855,12 @@ def run_change_analysis(
     workspace = batch.batch_dir / "workspace"
     openspec_dir = batch.batch_dir / "openspec"
 
+    if version_port is None:
+        from toyshop.adapters.version import ASTCodeVersionAdapter
+        version_port = ASTCodeVersionAdapter()
+
     # Phase 1: Code snapshot
-    snapshot = create_code_version(workspace, batch.project_name)
+    snapshot = version_port.create(workspace, batch.project_name)
     save_code_version(snapshot, batch.batch_dir / "snapshot.json")
     print(f"  Snapshot: {len(snapshot.modules)} modules")
 
