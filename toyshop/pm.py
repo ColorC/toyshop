@@ -18,6 +18,7 @@ Change (brownfield) workflow:
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from dataclasses import asdict, dataclass, field
@@ -1133,9 +1134,33 @@ def run_batch(
     llm: LLMPort | None = None,
     project_type: str = "python",
 ) -> BatchState:
-    """End-to-end: create batch → generate specs → parse tasks → run TDD pipeline."""
+    """End-to-end batch pipeline.
+
+    Default path: existing PM orchestration.
+    Graph path (feature flag): set TOYSHOP_USE_GRAPH=1.
+    """
     if llm is None:
         llm = create_llm()
+
+    # Optional graph facade path (incremental migration)
+    if os.getenv("TOYSHOP_USE_GRAPH") == "1":
+        from toyshop.graph.state import DevGraphState
+        from toyshop.graph.dev_pipeline import run_dev_graph
+
+        gstate = DevGraphState(
+            pm_root=pm_root,
+            project_name=project_name,
+            user_input=user_input,
+            project_type=project_type,
+        )
+        gstate = run_dev_graph(gstate, llm=llm)
+
+        if not gstate.batch_dir:
+            # Fallback safety
+            raise RuntimeError("Graph path did not produce batch_dir")
+
+        batch = load_batch(gstate.batch_dir)
+        return batch
 
     # Step 1: Create batch
     batch = create_batch(pm_root, project_name, user_input, project_type=project_type)
