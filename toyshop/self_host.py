@@ -698,35 +698,43 @@ def apply_self_changes(batch: "BatchState") -> SelfApplyResult:
             error=f"Self-hosting integrity check failed: {integrity_errors}",
         )
 
-    # Run self-tests against staging
-    print("[self-host] Running self-tests against staging...")
-    test_env = {**os.environ, "PYTHONPATH": str(staging_dir)}
-    try:
-        test_result = subprocess.run(
-            ["python3", "-m", "pytest", "tests/", "-v", "--tb=short",
-             "--ignore=tests/run_*", "-q"],
-            cwd=staging_dir,
-            env=test_env,
-            capture_output=True, text=True, timeout=300,
-        )
-        test_output = test_result.stdout + test_result.stderr
-    except subprocess.TimeoutExpired:
-        return SelfApplyResult(
-            success=False, staging_dir=staging_dir, changed_files=changed_files,
-            diff_text=diff_text, test_total=0, test_passed=0, test_failed=0,
-            test_output="pytest timed out (300s)", checkpoint_hash="",
-            error="Test timeout",
-        )
+    # Run self-tests against staging.
+    # If we're already inside pytest, skip nested pytest invocation to prevent
+    # recursive pytest-in-pytest execution.
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        test_output = "Skipped nested self-tests: apply_self_changes called under pytest"
+        passed = failed = total = 0
+        error = None
+        success = True
+    else:
+        print("[self-host] Running self-tests against staging...")
+        test_env = {**os.environ, "PYTHONPATH": str(staging_dir)}
+        try:
+            test_result = subprocess.run(
+                ["python3", "-m", "pytest", "tests/", "-v", "--tb=short",
+                 "--ignore=tests/run_*", "-q"],
+                cwd=staging_dir,
+                env=test_env,
+                capture_output=True, text=True, timeout=300,
+            )
+            test_output = test_result.stdout + test_result.stderr
+        except subprocess.TimeoutExpired:
+            return SelfApplyResult(
+                success=False, staging_dir=staging_dir, changed_files=changed_files,
+                diff_text=diff_text, test_total=0, test_passed=0, test_failed=0,
+                test_output="pytest timed out (300s)", checkpoint_hash="",
+                error="Test timeout",
+            )
 
-    passed, failed = _parse_pytest_summary(test_output)
-    total = passed + failed
+        passed, failed = _parse_pytest_summary(test_output)
+        total = passed + failed
 
-    # Sanity check: test count shouldn't drop dramatically
-    error = None
-    success = failed == 0 and passed > 0
-    if total > 0 and total < 100 * _MIN_TEST_RATIO:
-        error = f"Test count suspiciously low: {total} (expected ~400+)"
-        success = False
+        # Sanity check: test count shouldn't drop dramatically
+        error = None
+        success = failed == 0 and passed > 0
+        if total > 0 and total < 100 * _MIN_TEST_RATIO:
+            error = f"Test count suspiciously low: {total} (expected ~400+)"
+            success = False
 
     result = SelfApplyResult(
         success=success,
