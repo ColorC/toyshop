@@ -12,6 +12,7 @@ from toyshop.ports.storage import StoragePort
 from toyshop.ports.wiki import WikiPort
 from toyshop.ports.research import ResearchAgentPort
 from toyshop.ports.scope import ScopeControlPort
+from toyshop.ports.reporting import ReportingPort
 
 __all__ = [
     "LLMPort",
@@ -22,4 +23,5 @@ __all__ = [
     "WikiPort",
     "ResearchAgentPort",
     "ScopeControlPort",
+    "ReportingPort",
 ]

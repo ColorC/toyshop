@@ -51,3 +51,54 @@ class SQLiteStorageAdapter:
         result: dict | None = None,
     ) -> None:
         database.complete_workflow_run(run_id, status, result)
+
+    def append_process_step(
+        self,
+        run_id: str,
+        seq: int,
+        stage: str,
+        action: str,
+        status: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return database.append_process_step(
+            run_id,
+            seq,
+            stage,
+            action,
+            status,
+            agent_id=kwargs.get("agent_id", ""),
+            reason_ref=kwargs.get("reason_ref"),
+        )
+
+    def save_code_diff(
+        self,
+        run_id: str,
+        step_id: str,
+        file_path: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return database.save_code_diff(
+            run_id,
+            step_id,
+            file_path,
+            added=kwargs.get("added", 0),
+            deleted=kwargs.get("deleted", 0),
+            patch_text=kwargs.get("patch_text", ""),
+        )
+
+    def save_gate_result(
+        self,
+        run_id: str,
+        step_id: str,
+        gate_type: str,
+        passed: bool,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return database.save_gate_result(
+            run_id,
+            step_id,
+            gate_type,
+            passed,
+            report=kwargs.get("report"),
+        )

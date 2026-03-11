@@ -131,6 +131,7 @@ def run_development_pipeline(
     if state.architecture.tasks_markdown:
         (ws / "openspec" / "tasks.md").write_text(state.architecture.tasks_markdown)
     if state.architecture.spec_markdown:
+        (ws / "openspec" / "spec.md").write_text(state.architecture.spec_markdown)
         (ws / "openspec" / "specs").mkdir(exist_ok=True)
         (ws / "openspec" / "specs" / "main.md").write_text(state.architecture.spec_markdown)
 

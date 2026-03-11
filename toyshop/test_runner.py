@@ -6,10 +6,11 @@ Provides TestRunner ABC and PytestRunner (extracted from tdd_pipeline.py).
 from __future__ import annotations
 
 import re
-import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from toyshop.command_runner import run_command
 
 
 # ---------------------------------------------------------------------------
@@ -96,15 +97,8 @@ class PytestRunner(TestRunner):
         for pat in (ignore_patterns or []):
             cmd.extend(["--ignore", pat])
 
-        try:
-            result = subprocess.run(
-                cmd, cwd=workspace, capture_output=True, text=True, timeout=timeout,
-            )
-            combined = result.stdout + "\n" + result.stderr
-        except subprocess.TimeoutExpired:
-            combined = f"pytest timed out after {timeout}s"
-        except Exception as e:
-            combined = f"pytest execution error: {e}"
+        result = run_command(cmd, cwd=workspace, timeout=timeout)
+        combined = result.output
 
         parsed = self.parse_output(combined)
         parsed.per_test = self._parse_per_test_results(combined)
@@ -118,15 +112,8 @@ class PytestRunner(TestRunner):
     ) -> TestRunResult:
         """Run a single pytest test by ID."""
         cmd = ["python3", "-m", "pytest", test_id, "-v", "--tb=long"]
-        try:
-            result = subprocess.run(
-                cmd, cwd=workspace, capture_output=True, text=True, timeout=timeout,
-            )
-            combined = result.stdout + "\n" + result.stderr
-        except subprocess.TimeoutExpired:
-            combined = f"pytest timed out after {timeout}s"
-        except Exception as e:
-            combined = f"pytest execution error: {e}"
+        result = run_command(cmd, cwd=workspace, timeout=timeout)
+        combined = result.output
 
         parsed = self.parse_output(combined)
         parsed.per_test = self._parse_per_test_results(combined)
@@ -231,15 +218,8 @@ class GradleTestRunner(TestRunner):
     ) -> TestRunResult:
         """Run ./gradlew test and parse JUnit XML reports."""
         cmd = ["./gradlew", "test", "--no-daemon"]
-        try:
-            result = subprocess.run(
-                cmd, cwd=workspace, capture_output=True, text=True, timeout=timeout,
-            )
-            combined = result.stdout + "\n" + result.stderr
-        except subprocess.TimeoutExpired:
-            combined = f"gradlew test timed out after {timeout}s"
-        except Exception as e:
-            combined = f"gradlew execution error: {e}"
+        result = run_command(cmd, cwd=workspace, timeout=timeout)
+        combined = result.output
 
         # Try JUnit XML first, fall back to console output parsing
         xml_result = self._parse_junit_xml(workspace)
@@ -258,15 +238,8 @@ class GradleTestRunner(TestRunner):
     ) -> TestRunResult:
         """Run a single test by fully-qualified name (e.g. com.example.CalcTest#testAdd)."""
         cmd = ["./gradlew", "test", "--no-daemon", "--tests", test_id]
-        try:
-            result = subprocess.run(
-                cmd, cwd=workspace, capture_output=True, text=True, timeout=timeout,
-            )
-            combined = result.stdout + "\n" + result.stderr
-        except subprocess.TimeoutExpired:
-            combined = f"gradlew test timed out after {timeout}s"
-        except Exception as e:
-            combined = f"gradlew execution error: {e}"
+        result = run_command(cmd, cwd=workspace, timeout=timeout)
+        combined = result.output
 
         xml_result = self._parse_junit_xml(workspace)
         if xml_result and xml_result.total > 0:

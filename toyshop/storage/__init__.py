@@ -15,6 +15,13 @@ from toyshop.storage.database import (
     get_project_norms,
     save_health_check,
     get_health_history,
+    append_process_step,
+    save_code_diff,
+    save_gate_result,
+    get_process_steps,
+    get_code_diffs,
+    get_gate_results,
+    validate_completion_evidence,
 )
 from toyshop.storage.wiki import (
     WikiVersion,
@@ -52,6 +59,13 @@ __all__ = [
     "get_project_norms",
     "save_health_check",
     "get_health_history",
+    "append_process_step",
+    "save_code_diff",
+    "save_gate_result",
+    "get_process_steps",
+    "get_code_diffs",
+    "get_gate_results",
+    "validate_completion_evidence",
     # Wiki
     "WikiVersion",
     "WikiTestSuite",

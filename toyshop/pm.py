@@ -31,6 +31,7 @@ from toyshop.ports.llm import LLMPort
 from toyshop.ports.coding import CodingAgentPort
 from toyshop.ports.spec import SpecPort
 from toyshop.ports.version import CodeVersionPort
+from toyshop.ports.reporting import ReportingPort
 from toyshop.workflows.requirement import run_requirement_workflow
 from toyshop.workflows.architecture import run_architecture_workflow
 from toyshop.tdd_pipeline import TDDResult
@@ -873,6 +874,9 @@ def _create_wiki_version(
     from toyshop.storage.database import (
         init_database, get_latest_snapshot, create_project, get_db,
         save_architecture_from_design,
+        create_workflow_run, complete_workflow_run,
+        append_process_step, save_code_diff, save_gate_result,
+        validate_completion_evidence,
     )
     from toyshop.storage.wiki import (
         create_version, save_test_suite, extract_test_metadata, log_event,
@@ -894,6 +898,11 @@ def _create_wiki_version(
     else:
         proj = create_project(batch.project_name, str(workspace))
         project_id = proj["id"]
+
+    # Create workflow run for evidence chain
+    workflow_type = "tdd_create" if mode == "create" else "tdd_modify"
+    run = create_workflow_run(project_id, workflow_type, batch.batch_id)
+    run_id = run["id"]
 
     # Parse design.md → structured snapshot of modules + interfaces
     snapshot_id = None
@@ -962,6 +971,61 @@ def _create_wiki_version(
         openspec_dir=batch.batch_dir / "openspec",
     )
 
+    step_seq = 1
+    step_start = append_process_step(
+        run_id,
+        step_seq,
+        "coding",
+        "run_tdd",
+        "success" if result.success else "failed",
+        agent_id="coding_agent",
+        reason_ref={"batch_id": batch.batch_id, "mode": mode},
+    )
+
+    if result.files_created:
+        for fp in sorted(result.files_created):
+            save_code_diff(run_id, step_start["id"], fp, added=1, deleted=0, patch_text="")
+
+    if result.files_modified:
+        for fp in sorted(result.files_modified):
+            save_code_diff(run_id, step_start["id"], fp, added=0, deleted=0, patch_text="")
+
+    step_seq += 1
+    step_whitebox = append_process_step(
+        run_id,
+        step_seq,
+        "testing",
+        "whitebox_gate",
+        "success" if result.whitebox_passed else "failed",
+        agent_id="test_runner",
+        reason_ref={"batch_id": batch.batch_id},
+    )
+    save_gate_result(
+        run_id,
+        step_whitebox["id"],
+        "whitebox",
+        result.whitebox_passed,
+        report={"output": result.whitebox_output[:4000]},
+    )
+
+    step_seq += 1
+    step_blackbox = append_process_step(
+        run_id,
+        step_seq,
+        "testing",
+        "blackbox_gate",
+        "success" if result.blackbox_passed else "failed",
+        agent_id="test_runner",
+        reason_ref={"batch_id": batch.batch_id},
+    )
+    save_gate_result(
+        run_id,
+        step_blackbox["id"],
+        "blackbox",
+        result.blackbox_passed,
+        report={"output": result.blackbox_output[:4000]},
+    )
+
     test_files, test_cases = extract_test_metadata(workspace)
     save_test_suite(
         version_id=version.id,
@@ -985,6 +1049,32 @@ def _create_wiki_version(
     _try_health_check(version, project_id, batch.project_type,
                       db_modules if snapshot_id else [],
                       db_interfaces if snapshot_id else None)
+
+    # Completion guard: completed runs must carry full evidence chain
+    ok_evidence, missing = validate_completion_evidence(run_id)
+    if result.success and not ok_evidence:
+        complete_workflow_run(
+            run_id,
+            "failed",
+            {
+                "success": False,
+                "summary": "completion evidence guard failed",
+                "missing": missing,
+                "version_id": version.id,
+            },
+        )
+        raise RuntimeError(f"completion evidence guard failed: {', '.join(missing)}")
+
+    complete_workflow_run(
+        run_id,
+        "completed" if result.success else "failed",
+        {
+            "success": result.success,
+            "summary": result.summary,
+            "version_id": version.id,
+            "missing_evidence": missing if not ok_evidence else [],
+        },
+    )
 
     snap_info = f", snapshot={snapshot_id[:8]}" if snapshot_id else ""
     print(f"  [wiki] Created version {version.version_number} "
@@ -1120,9 +1210,36 @@ def run_batch_tdd(
         try:
             _create_wiki_version(batch, workspace, result, mode)
         except Exception as wiki_err:
+            batch.status = "failed"
+            batch.error = f"Wiki/version evidence error: {wiki_err}"
+            _save_progress(batch)
+            from toyshop.storage.database import init_database, get_db, complete_workflow_run
+
+            try:
+                db_path = workspace / ".toyshop" / "architecture.db"
+                init_database(db_path)
+                db = get_db()
+                cur = db.execute(
+                    "SELECT id FROM projects WHERE name = ? LIMIT 1",
+                    (batch.project_name,),
+                )
+                row = cur.fetchone()
+                if row:
+                    runs = db.execute(
+                        "SELECT id FROM workflow_runs WHERE project_id = ? ORDER BY created_at DESC LIMIT 1",
+                        (row["id"],),
+                    ).fetchall()
+                    if runs:
+                        complete_workflow_run(
+                            runs[0]["id"],
+                            "failed",
+                            {"success": False, "error": str(wiki_err), "phase": "wiki_version"},
+                        )
+            except Exception:
+                pass
             print(f"  [!] Wiki version creation failed: {wiki_err}")
 
-    status_icon = "✓" if result.success else "✗"
+    status_icon = "✓" if batch.status == "completed" else "✗"
     print(f"  [{status_icon}] Batch TDD — {batch.status}")
     return result
 
@@ -1133,6 +1250,8 @@ def run_batch(
     user_input: str,
     llm: LLMPort | None = None,
     project_type: str = "python",
+    *,
+    allow_graph: bool = True,
 ) -> BatchState:
     """End-to-end batch pipeline.
 
@@ -1143,7 +1262,7 @@ def run_batch(
         llm = create_llm()
 
     # Optional graph facade path (incremental migration)
-    if os.getenv("TOYSHOP_USE_GRAPH") == "1":
+    if allow_graph and os.getenv("TOYSHOP_USE_GRAPH") == "1":
         from toyshop.graph.state import DevGraphState
         from toyshop.graph.dev_pipeline import run_dev_graph
 
@@ -1182,13 +1301,14 @@ def run_batch(
     return batch
 
 
-def _write_mid_report_placeholder(
+def _write_mid_report(
     batch: BatchState,
     *,
     auto_continue_sota: bool,
     mvp_summary: str,
+    reporting_port: ReportingPort | None = None,
 ) -> None:
-    """Persist MVP mid-report hook payload (placeholder until channel is integrated)."""
+    """Persist MVP mid-report payload via reporting port (file adapter by default)."""
     payload = {
         "run_id": batch.batch_id,
         "checkpoint": "mvp_uploaded",
@@ -1199,7 +1319,28 @@ def _write_mid_report_placeholder(
         ),
         "created_at": _now_iso(),
     }
-    _write_json(batch.batch_dir / "mid_report_hook.json", payload)
+
+    if reporting_port is None:
+        from toyshop.adapters.reporting import FileReportingAdapter
+        reporting_port = FileReportingAdapter()
+
+    reporting_port.publish(payload, run_dir=batch.batch_dir)
+
+
+def _write_mid_report_placeholder(
+    batch: BatchState,
+    *,
+    auto_continue_sota: bool,
+    mvp_summary: str,
+    reporting_port: ReportingPort | None = None,
+) -> None:
+    """Backward-compatible wrapper for mid-report publishing."""
+    _write_mid_report(
+        batch,
+        auto_continue_sota=auto_continue_sota,
+        mvp_summary=mvp_summary,
+        reporting_port=reporting_port,
+    )
 
 
 def run_batch_phased(
@@ -1213,6 +1354,7 @@ def run_batch_phased(
     enable_research_agent: bool = True,
     research_timebox_minutes: int = 8,
     auto_approve_research: bool = True,
+    reporting_port: ReportingPort | None = None,
 ) -> BatchState:
     """Phased pipeline: research -> MVP -> mvp_uploaded -> SOTA.
 
@@ -1397,6 +1539,7 @@ def run_batch_phased(
         batch,
         auto_continue_sota=auto_continue_sota,
         mvp_summary=mvp_result.summary,
+        reporting_port=reporting_port,
     )
     _append_stage_event(
         batch,
@@ -1885,7 +2028,7 @@ def run_change_analysis(
         version_port = ASTCodeVersionAdapter()
 
     # Phase 1: Code snapshot
-    snapshot = version_port.create(workspace, batch.project_name)
+    snapshot = version_port.create_code_version(workspace, batch.project_name)
     save_code_version(snapshot, batch.batch_dir / "snapshot.json")
     print(f"  Snapshot: {len(snapshot.modules)} modules")
 

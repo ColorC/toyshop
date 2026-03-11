@@ -18,6 +18,8 @@ from pydantic import SecretStr
 from openhands.sdk import LLM, Message, TextContent
 from openhands.sdk.llm.llm_response import LLMResponse
 
+from toyshop.llm_gateway import apply_gateway_compat_patch
+
 import logging
 logger = logging.getLogger(__name__)
 
@@ -131,66 +133,9 @@ def create_llm(
         prompt_cache_retention=None,
     )
     # Strip params that gateways may reject from Responses API calls
-    _patch_responses_drop_params(llm)
+    apply_gateway_compat_patch()
     return llm
 
-
-def _patch_responses_drop_params(llm: LLM) -> None:
-    """Strip unsupported params and fix input for Responses API requests.
-
-    The aistock.tech gateway:
-    1. Returns 502 on `temperature`, `top_p`, etc.
-    2. Returns 502 if `function_call` items lack matching `function_call_output`.
-
-    We intercept at the litellm responses level to fix both issues.
-    """
-    import litellm as _litellm
-    import openhands.sdk.llm.llm as _sdk_llm_module
-
-    if getattr(_litellm, '_toyshop_responses_patched', False):
-        return
-
-    _original_responses = _sdk_llm_module.litellm_responses
-
-    _DROP_PARAMS = {'temperature', 'top_p', 'presence_penalty', 'frequency_penalty'}
-
-    def _ensure_function_call_outputs(input_items: list) -> list:
-        """Ensure every function_call has a matching function_call_output."""
-        if not isinstance(input_items, list):
-            return input_items
-
-        # Collect call_ids that have outputs
-        output_ids = set()
-        for item in input_items:
-            if isinstance(item, dict) and item.get('type') == 'function_call_output':
-                output_ids.add(item.get('call_id'))
-
-        # Find function_calls missing outputs and inject placeholder
-        result = []
-        for item in input_items:
-            result.append(item)
-            if isinstance(item, dict) and item.get('type') == 'function_call':
-                call_id = item.get('call_id') or item.get('id')
-                if call_id and call_id not in output_ids:
-                    result.append({
-                        'type': 'function_call_output',
-                        'call_id': call_id,
-                        'output': 'Tool executed successfully.',
-                    })
-                    output_ids.add(call_id)
-        return result
-
-    def _filtered_responses(*args, **kwargs):
-        for p in _DROP_PARAMS:
-            kwargs.pop(p, None)
-        # Fix missing function_call_output
-        if 'input' in kwargs:
-            kwargs['input'] = _ensure_function_call_outputs(kwargs['input'])
-        return _original_responses(*args, **kwargs)
-
-    _sdk_llm_module.litellm_responses = _filtered_responses
-    _litellm.responses = _filtered_responses
-    _litellm._toyshop_responses_patched = True
 
 
 # ---------------------------------------------------------------------------
@@ -265,12 +210,14 @@ def _chat_with_tool_messages(
 
     # Use streaming to match Claude Code's behavior — keeps connection alive
     # and avoids proxy upstream disconnecting during long non-streaming waits.
+    # Force tool use to prevent the model from responding with plain text.
     with client.messages.stream(
         model=model_id,
-        system=system_prompt + f"\n\nYou MUST use the `{tool_name}` tool to respond. Do not reply with text.",
+        system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
         tools=[tool_def],
-        max_tokens=4096,
+        tool_choice={"type": "tool", "name": tool_name},
+        max_tokens=8192,
     ) as stream:
         response = stream.get_final_message()
 

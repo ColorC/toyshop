@@ -18,10 +18,11 @@ import json
 import os
 import re
 import shutil
-import subprocess
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+
+from toyshop.command_runner import run_command
 
 if TYPE_CHECKING:
     from toyshop.llm import LLM
@@ -667,21 +668,23 @@ def apply_self_changes(batch: "BatchState") -> SelfApplyResult:
             shutil.copy2(src, dst)
 
     # Generate unified diff
-    diff_result = subprocess.run(
+    diff_result = run_command(
         ["diff", "-ruN",
          "--exclude=__pycache__", "--exclude=.pytest_cache", "--exclude=.git",
          str(_TOYSHOP_ROOT / "toyshop"), str(staging_dir / "toyshop")],
-        capture_output=True, text=True, timeout=30,
+        cwd=_TOYSHOP_ROOT,
+        timeout=30,
     )
     diff_text = diff_result.stdout
 
     # Also diff tests/ if changed
     if any(f.startswith("tests/") for f in changed_files):
-        tests_diff = subprocess.run(
+        tests_diff = run_command(
             ["diff", "-ruN",
              "--exclude=__pycache__", "--exclude=.pytest_cache",
              str(_TOYSHOP_ROOT / "tests"), str(staging_dir / "tests")],
-            capture_output=True, text=True, timeout=30,
+            cwd=_TOYSHOP_ROOT,
+            timeout=30,
         )
         diff_text += tests_diff.stdout
 
@@ -709,16 +712,15 @@ def apply_self_changes(batch: "BatchState") -> SelfApplyResult:
     else:
         print("[self-host] Running self-tests against staging...")
         test_env = {**os.environ, "PYTHONPATH": str(staging_dir)}
-        try:
-            test_result = subprocess.run(
-                ["python3", "-m", "pytest", "tests/", "-v", "--tb=short",
-                 "--ignore=tests/run_*", "-q"],
-                cwd=staging_dir,
-                env=test_env,
-                capture_output=True, text=True, timeout=300,
-            )
-            test_output = test_result.stdout + test_result.stderr
-        except subprocess.TimeoutExpired:
+        test_result = run_command(
+            ["python3", "-m", "pytest", "tests/", "-v", "--tb=short",
+             "--ignore=tests/run_*", "-q"],
+            cwd=staging_dir,
+            env=test_env,
+            timeout=300,
+        )
+        test_output = test_result.output
+        if test_result.timed_out:
             return SelfApplyResult(
                 success=False, staging_dir=staging_dir, changed_files=changed_files,
                 diff_text=diff_text, test_total=0, test_passed=0, test_failed=0,
@@ -799,18 +801,18 @@ def commit_self_changes(
 
     # Final verification: run tests against the real source tree
     print("[self-host] Final verification...")
-    try:
-        test_result = subprocess.run(
-            ["python3", "-m", "pytest", "tests/", "-v", "--tb=short",
-             "--ignore=tests/run_*", "-q"],
-            cwd=_TOYSHOP_ROOT,
-            capture_output=True, text=True, timeout=300,
-        )
-        passed, failed = _parse_pytest_summary(test_result.stdout + test_result.stderr)
-    except subprocess.TimeoutExpired:
+    test_result = run_command(
+        ["python3", "-m", "pytest", "tests/", "-v", "--tb=short",
+         "--ignore=tests/run_*", "-q"],
+        cwd=_TOYSHOP_ROOT,
+        timeout=300,
+    )
+    if test_result.timed_out:
         print("[self-host] Final tests timed out — rolling back!")
         rollback.rollback_to(checkpoint)
         return {"success": False, "error": "Final test timeout, rolled back"}
+
+    passed, failed = _parse_pytest_summary(test_result.output)
 
     if failed > 0:
         print(f"[self-host] Final tests FAILED ({failed} failures) — rolling back!")

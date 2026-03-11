@@ -70,3 +70,36 @@ class StoragePort(Protocol):
     ) -> None:
         """Mark workflow run as completed or failed."""
         ...
+
+    def append_process_step(
+        self,
+        run_id: str,
+        seq: int,
+        stage: str,
+        action: str,
+        status: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Append a process step in execution trace."""
+        ...
+
+    def save_code_diff(
+        self,
+        run_id: str,
+        step_id: str,
+        file_path: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Save code diff metadata bound to a process step."""
+        ...
+
+    def save_gate_result(
+        self,
+        run_id: str,
+        step_id: str,
+        gate_type: str,
+        passed: bool,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Save gate result bound to a process step."""
+        ...

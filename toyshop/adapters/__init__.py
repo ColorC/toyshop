@@ -10,5 +10,6 @@ from toyshop.adapters.version import ASTCodeVersionAdapter
 from toyshop.adapters.storage import SQLiteStorageAdapter
 from toyshop.adapters.wiki import SQLiteWikiAdapter
 from toyshop.adapters.research import GPTResearcherAdapter
+from toyshop.adapters.reporting import FileReportingAdapter
 
 from toyshop.adapters.scope import ScopeControlAdapter

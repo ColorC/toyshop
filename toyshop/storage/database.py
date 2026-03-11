@@ -242,6 +242,48 @@ def _create_tables() -> None:
             )
         """)
 
+        # --- Process steps (execution trace) ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS process_steps (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                agent_id TEXT,
+                stage TEXT NOT NULL,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason_ref_json TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        # --- Code diffs (bound to process steps) ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS code_diffs (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                step_id TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                added INTEGER NOT NULL DEFAULT 0,
+                deleted INTEGER NOT NULL DEFAULT 0,
+                patch_text TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        # --- Gate results (bound to process steps) ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS gate_results (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                step_id TEXT NOT NULL,
+                gate_type TEXT NOT NULL,
+                passed INTEGER NOT NULL,
+                report_json TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+
 
 # ---------------------------------------------------------------------------
 # Project operations
@@ -446,6 +488,19 @@ def delete_project(project_id: str) -> None:
         cur.execute("DELETE FROM snapshots WHERE project_id = ?", (project_id,))
         cur.execute("DELETE FROM project_norms WHERE project_id = ?", (project_id,))
         cur.execute("DELETE FROM run_events WHERE project_id = ?", (project_id,))
+
+        # Execution evidence tables (bound by run_id)
+        run_ids = [
+            r[0] for r in cur.execute(
+                "SELECT id FROM workflow_runs WHERE project_id = ?", (project_id,)
+            ).fetchall()
+        ]
+        if run_ids:
+            rp = ",".join("?" * len(run_ids))
+            cur.execute(f"DELETE FROM code_diffs WHERE run_id IN ({rp})", run_ids)
+            cur.execute(f"DELETE FROM gate_results WHERE run_id IN ({rp})", run_ids)
+            cur.execute(f"DELETE FROM process_steps WHERE run_id IN ({rp})", run_ids)
+
         cur.execute("DELETE FROM workflow_runs WHERE project_id = ?", (project_id,))
         cur.execute("DELETE FROM change_plans WHERE project_id = ?", (project_id,))
         cur.execute("DELETE FROM projects WHERE id = ?", (project_id,))
@@ -701,3 +756,186 @@ def get_change_plans(
             d["impact"] = None
         results.append(d)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Execution evidence chain (process steps / diffs / gate results)
+# ---------------------------------------------------------------------------
+
+
+def append_process_step(
+    run_id: str,
+    seq: int,
+    stage: str,
+    action: str,
+    status: str,
+    *,
+    agent_id: str = "",
+    reason_ref: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Append a process step for execution traceability."""
+    import uuid
+
+    now = datetime.utcnow().isoformat()
+    step_id = str(uuid.uuid4())[:8]
+    with transaction() as cur:
+        cur.execute(
+            """INSERT INTO process_steps
+            (id, run_id, seq, agent_id, stage, action, status, reason_ref_json, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                step_id,
+                run_id,
+                seq,
+                agent_id,
+                stage,
+                action,
+                status,
+                json.dumps(reason_ref or {}),
+                now,
+            ),
+        )
+
+    return {
+        "id": step_id,
+        "run_id": run_id,
+        "seq": seq,
+        "agent_id": agent_id,
+        "stage": stage,
+        "action": action,
+        "status": status,
+        "reason_ref": reason_ref or {},
+        "created_at": now,
+    }
+
+
+def save_code_diff(
+    run_id: str,
+    step_id: str,
+    file_path: str,
+    *,
+    added: int = 0,
+    deleted: int = 0,
+    patch_text: str = "",
+) -> dict[str, Any]:
+    """Persist code diff metadata bound to a process step."""
+    import uuid
+
+    now = datetime.utcnow().isoformat()
+    diff_id = str(uuid.uuid4())[:8]
+    with transaction() as cur:
+        cur.execute(
+            """INSERT INTO code_diffs
+            (id, run_id, step_id, file_path, added, deleted, patch_text, created_at)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (diff_id, run_id, step_id, file_path, added, deleted, patch_text, now),
+        )
+
+    return {
+        "id": diff_id,
+        "run_id": run_id,
+        "step_id": step_id,
+        "file_path": file_path,
+        "added": added,
+        "deleted": deleted,
+        "patch_text": patch_text,
+        "created_at": now,
+    }
+
+
+def save_gate_result(
+    run_id: str,
+    step_id: str,
+    gate_type: str,
+    passed: bool,
+    *,
+    report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Persist gate result bound to a process step."""
+    import uuid
+
+    now = datetime.utcnow().isoformat()
+    gate_id = str(uuid.uuid4())[:8]
+    with transaction() as cur:
+        cur.execute(
+            """INSERT INTO gate_results
+            (id, run_id, step_id, gate_type, passed, report_json, created_at)
+            VALUES (?,?,?,?,?,?,?)""",
+            (gate_id, run_id, step_id, gate_type, 1 if passed else 0, json.dumps(report or {}), now),
+        )
+
+    return {
+        "id": gate_id,
+        "run_id": run_id,
+        "step_id": step_id,
+        "gate_type": gate_type,
+        "passed": passed,
+        "report": report or {},
+        "created_at": now,
+    }
+
+
+def get_process_steps(run_id: str) -> list[dict[str, Any]]:
+    """Get process steps for a run in sequence order."""
+    db = get_db()
+    cur = db.execute(
+        "SELECT * FROM process_steps WHERE run_id = ? ORDER BY seq ASC, created_at ASC",
+        (run_id,),
+    )
+    out: list[dict[str, Any]] = []
+    for row in cur.fetchall():
+        d = dict(row)
+        d["reason_ref"] = json.loads(d.get("reason_ref_json") or "{}")
+        out.append(d)
+    return out
+
+
+def get_code_diffs(run_id: str) -> list[dict[str, Any]]:
+    """Get code diff records for a run."""
+    db = get_db()
+    cur = db.execute(
+        "SELECT * FROM code_diffs WHERE run_id = ? ORDER BY created_at ASC",
+        (run_id,),
+    )
+    return [dict(row) for row in cur.fetchall()]
+
+
+def get_gate_results(run_id: str) -> list[dict[str, Any]]:
+    """Get gate results for a run."""
+    db = get_db()
+    cur = db.execute(
+        "SELECT * FROM gate_results WHERE run_id = ? ORDER BY created_at ASC",
+        (run_id,),
+    )
+    out: list[dict[str, Any]] = []
+    for row in cur.fetchall():
+        d = dict(row)
+        d["passed"] = bool(d.get("passed", 0))
+        d["report"] = json.loads(d.get("report_json") or "{}")
+        out.append(d)
+    return out
+
+
+def validate_completion_evidence(run_id: str) -> tuple[bool, list[str]]:
+    """Validate run has minimal completion evidence chain."""
+    missing: list[str] = []
+
+    steps = get_process_steps(run_id)
+    if not steps:
+        missing.append("process_steps")
+
+    diffs = get_code_diffs(run_id)
+    if not diffs:
+        missing.append("code_diffs")
+
+    gates = get_gate_results(run_id)
+    if not gates:
+        missing.append("gate_results")
+    else:
+        gate_types = {g.get("gate_type", "") for g in gates}
+        if "whitebox" not in gate_types:
+            missing.append("whitebox_gate")
+        if "blackbox" not in gate_types:
+            missing.append("blackbox_gate")
+
+    return len(missing) == 0, missing

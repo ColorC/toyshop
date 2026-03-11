@@ -217,6 +217,59 @@ def test_run_batch_phased_mvp_deadlock_resolution_retry(monkeypatch, tmp_path: P
     assert mvp_tdd_gates[1]["passed"] is True
 
 
+def test_run_batch_phased_uses_injected_reporting_port(monkeypatch, tmp_path: Path):
+    calls: list[str] = []
+
+    class InMemoryReportingPort:
+        def __init__(self):
+            self.events = []
+
+        def publish(self, event, *, run_dir=None):
+            self.events.append((event, run_dir))
+
+    reporting = InMemoryReportingPort()
+
+    def fake_run_spec_generation(batch, llm, **kwargs):
+        batch.status = "in_progress"
+        batch.error = None
+        openspec_dir = batch.batch_dir / "openspec"
+        openspec_dir.mkdir(exist_ok=True)
+        for f in ("proposal.md", "design.md", "tasks.md", "spec.md"):
+            (openspec_dir / f).write_text(f"# {f}\n", encoding="utf-8")
+        return batch
+
+    def fake_prepare_tasks(batch):
+        return []
+
+    def fake_run_batch_tdd(batch, llm, mode="create"):
+        calls.append(mode)
+        batch.status = "completed"
+        batch.error = None
+        return _ok_tdd_result(summary=f"{mode} ok")
+
+    monkeypatch.setattr("toyshop.pm.run_spec_generation", fake_run_spec_generation)
+    monkeypatch.setattr("toyshop.pm.prepare_tasks", fake_prepare_tasks)
+    monkeypatch.setattr("toyshop.pm.run_batch_tdd", fake_run_batch_tdd)
+
+    batch = run_batch_phased(
+        pm_root=tmp_path,
+        project_name="demo",
+        user_input="build auth system",
+        llm=object(),
+        auto_continue_sota=False,
+        enable_research_agent=False,
+        reporting_port=reporting,
+    )
+
+    assert batch.status == "completed"
+    assert calls == ["create"]
+    assert len(reporting.events) == 1
+    event, run_dir = reporting.events[0]
+    assert event["checkpoint"] == "mvp_uploaded"
+    assert run_dir == batch.batch_dir
+    assert not (batch.batch_dir / "mid_report_hook.json").exists()
+
+
 def test_run_research_planning_rejects_unknown_trigger(tmp_path: Path):
     batch = create_batch(tmp_path, "demo", "build auth system")
     with pytest.raises(ValueError):

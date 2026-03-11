@@ -24,7 +24,6 @@ from __future__ import annotations
 import ast
 import json
 import re
-import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -43,6 +42,7 @@ from openhands.sdk.tool import (
 from toyshop.project_type import get_project_type, ProjectType
 from toyshop.lang.base import get_language_support, LanguageSupport
 from toyshop.test_runner import get_test_runner, TestRunner as _TestRunner, PytestRunner, RconTestRunner
+from toyshop.command_runner import run_command
 import toyshop.lang.python_lang  # noqa: F401 — trigger auto-registration
 
 # Import tools to trigger registration
@@ -218,20 +218,8 @@ def _find_test_placeholder_issues(test_file: Path, rel_path: str) -> list[str]:
 
 def _run_pytest_collect_only(workspace: Path, timeout: int = 120) -> tuple[bool, str]:
     cmd = ["python3", "-m", "pytest", "tests/", "--collect-only", "-q"]
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"{' '.join(cmd)} timed out after {timeout}s"
-    except Exception as e:
-        return False, f"{' '.join(cmd)} execution error: {e}"
-    output = (result.stdout + "\n" + result.stderr).strip()
-    return result.returncode == 0, output
+    result = run_command(cmd, cwd=workspace, timeout=timeout)
+    return result.returncode == 0, result.output
 
 
 def _test_generation_quality_issues(workspace: Path, test_files: list[str]) -> list[str]:
@@ -1629,15 +1617,8 @@ def run_tests_automated(
     for pat in (ignore_patterns or []):
         cmd.extend(["--ignore", pat])
 
-    try:
-        result = subprocess.run(
-            cmd, cwd=workspace, capture_output=True, text=True, timeout=timeout,
-        )
-        combined = result.stdout + "\n" + result.stderr
-    except subprocess.TimeoutExpired:
-        combined = f"pytest timed out after {timeout}s"
-    except Exception as e:
-        combined = f"pytest execution error: {e}"
+    result = run_command(cmd, cwd=workspace, timeout=timeout)
+    combined = result.output
 
     parsed = parse_pytest_output(combined)
     parsed.per_test = _parse_per_test_results(combined)

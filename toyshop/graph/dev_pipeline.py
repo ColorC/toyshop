@@ -32,6 +32,7 @@ def run_dev_graph(
         user_input=state.user_input,
         llm=llm,
         project_type=state.project_type,
+        allow_graph=False,
     )
 
     state.batch_id = batch.batch_id
