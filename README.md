@@ -1,3 +1,10 @@
+
+<p align="center">
+  <a href="https://claude.ai/">
+    <img src="https://img.shields.io/badge/Made%20with-Claude-D97757?style=for-the-badge&logo=anthropic&logoColor=white" alt="Made with Claude">
+  </a>
+</p>
+
 # ToyShop — AI 全自动软件工厂
 
 > _"当 AI 告诉你它完成了任务，不要相信它的语感，只相信跑通的测试用例。"_
